@@ -2,8 +2,14 @@ import sempy.fabric as fabric
 import pandas as pd
 from typing import Optional
 import sempy_labs._icons as icons
+from uuid import UUID
+from sempy_labs._helper_functions import (
+    resolve_workspace_name_and_id,
+)
+from sempy._utils._log import log
 
 
+@log
 def get_direct_lake_guardrails() -> pd.DataFrame:
     """
     Shows the guardrails for when Direct Lake semantic models will fallback to Direct Query
@@ -28,14 +34,14 @@ def get_direct_lake_guardrails() -> pd.DataFrame:
     return df
 
 
-def get_sku_size(workspace: Optional[str] = None) -> str:
+def get_sku_size(workspace: Optional[str | UUID] = None) -> str:
     """
     Shows the SKU size for a workspace.
 
     Parameters
     ----------
-    workspace : str, default=None
-        The Fabric workspace name.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
 
@@ -44,16 +50,19 @@ def get_sku_size(workspace: Optional[str] = None) -> str:
     str
         The SKU size for a workspace.
     """
+    from sempy_labs._capacities import list_capacities
 
-    workspace = fabric.resolve_workspace_name(workspace)
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
 
-    dfW = fabric.list_workspaces(filter=f"name eq '{workspace}'")
+    dfW = fabric.list_workspaces(filter=f"id eq '{workspace_id}'")
 
     if len(dfW) == 0:
-        raise ValueError(f"{icons.red_dot} The '{workspace}' is not a valid workspace.")
+        raise ValueError(
+            f"{icons.red_dot} The '{workspace_name}' is not a valid workspace."
+        )
 
     capacity_id = dfW["Capacity Id"].iloc[0]
-    dfC = fabric.list_capacities()
+    dfC = list_capacities()
     dfC_filt = dfC[dfC["Id"] == capacity_id]
 
     if len(dfC_filt) == 0:

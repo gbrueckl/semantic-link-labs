@@ -2,7 +2,6 @@ import sempy.fabric as fabric
 import pandas as pd
 import json
 import os
-import time
 import copy
 from anytree import Node, RenderTree
 from powerbiclient import Report
@@ -10,37 +9,41 @@ from pyspark.sql.functions import col, flatten
 from sempy_labs.report._generate_report import update_report_from_reportjson
 from sempy_labs.lakehouse._lakehouse import lakehouse_attached
 from sempy_labs._helper_functions import (
-    generate_embedded_filter,
     resolve_report_id,
-    resolve_lakehouse_name,
     language_validate,
     resolve_workspace_name_and_id,
-    lro,
     _decode_b64,
     resolve_dataset_id,
+    _update_dataframe_datatypes,
+    _base_api,
+    _create_spark_session,
+    _mount,
+    resolve_workspace_id,
+    resolve_item_name_and_id,
 )
 from typing import List, Optional, Union
 from sempy._utils._log import log
 import sempy_labs._icons as icons
-from sempy.fabric.exceptions import FabricHTTPException
+from uuid import UUID
 
 
+@log
 def get_report_json(
     report: str,
-    workspace: Optional[str] = None,
+    workspace: Optional[str | UUID] = None,
     save_to_file_name: Optional[str] = None,
 ) -> dict:
     """
-    Gets the report.json file content of a Power BI report.
+    Gets the report.json file content of a Power BI report. This function only supports reports in the PBIR-Legacy format.
 
     This is a wrapper function for the following API: `Items - Get Report Definition <https://learn.microsoft.com/rest/api/fabric/report/items/get-report-definition>`_.
 
     Parameters
     ----------
-    report : str
-        Name of the Power BI report.
-    workspace : str, default=None
-        The Fabric workspace name in which the report exists.
+    report : str | uuid.UUID
+        Name or ID of the Power BI report.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID in which the report exists.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
     save_to_file_name : str, default=None
@@ -52,21 +55,28 @@ def get_report_json(
         The report.json file for a given Power BI report.
     """
 
-    (workspace, workspace_id) = resolve_workspace_name_and_id(workspace)
-    report_id = resolve_report_id(report=report, workspace=workspace)
-    fmt = "PBIR-Legacy"
-
-    client = fabric.FabricRestClient()
-    response = client.post(
-        f"/v1/workspaces/{workspace_id}/reports/{report_id}/getDefinition?format={fmt}"
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
+    (report_name, report_id) = resolve_item_name_and_id(
+        item=report, type="Report", workspace=workspace_id
     )
 
-    result = lro(client, response).json()
-    df_items = pd.json_normalize(result["definition"]["parts"])
-    df_items_filt = df_items[df_items["path"] == "report.json"]
-    payload = df_items_filt["payload"].iloc[0]
-    report_file = _decode_b64(payload)
-    report_json = json.loads(report_file)
+    result = _base_api(
+        request=f"/v1/workspaces/{workspace_id}/reports/{report_id}/getDefinition",
+        method="post",
+        lro_return_json=True,
+        status_codes=None,
+    )
+    report_json = None
+    for part in result.get("definition", {}).get("parts", {}):
+        if part.get("path") == "report.json":
+            payload = part.get("payload")
+            report_file = _decode_b64(payload)
+            report_json = json.loads(report_file)
+
+    if not report_json:
+        raise ValueError(
+            f"{icons.red_dot} Unable to retrieve report.json for the '{report_name}' report within the '{workspace_name}' workspace. This function only supports reports in the PBIR-Legacy format."
+        )
 
     if save_to_file_name is not None:
         if not lakehouse_attached():
@@ -74,41 +84,38 @@ def get_report_json(
                 f"{icons.red_dot} In order to save the report.json file, a lakehouse must be attached to the notebook. Please attach a lakehouse to this notebook."
             )
 
-        lakehouse_id = fabric.get_lakehouse_id()
-        lake_workspace = fabric.resolve_workspace_name()
-        lakehouse = resolve_lakehouse_name(lakehouse_id, lake_workspace)
-        folderPath = "/lakehouse/default/Files"
-        fileExt = ".json"
-        if not save_to_file_name.endswith(fileExt):
-            save_to_file_name = f"{save_to_file_name}{fileExt}"
-        filePath = os.path.join(folderPath, save_to_file_name)
-        with open(filePath, "w") as json_file:
+        local_path = _mount()
+        save_folder = f"{local_path}/Files"
+        file_ext = ".json"
+        if not save_to_file_name.endswith(file_ext):
+            save_to_file_name = f"{save_to_file_name}{file_ext}"
+        file_path = os.path.join(save_folder, save_to_file_name)
+        with open(file_path, "w") as json_file:
             json.dump(report_json, json_file, indent=4)
         print(
-            f"{icons.green_dot} The report.json file for the '{report}' report has been saved to the '{lakehouse}' in this location: '{filePath}'.\n\n"
+            f"{icons.green_dot} The report.json file for the '{report}' report has been saved to the lakehouse attached to this notebook in this location: Files/'{save_to_file_name}'.\n\n"
         )
 
     return report_json
 
 
-def report_dependency_tree(workspace: Optional[str] = None):
+@log
+def report_dependency_tree(workspace: Optional[str | UUID] = None):
     """
     Prints a dependency between reports and semantic models.
 
     Parameters
     ----------
-    workspace : str, default=None
-        The Fabric workspace name.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
     """
 
-    if workspace is None:
-        workspaceId = fabric.get_workspace_id()
-        workspace = fabric.resolve_workspace_name(workspaceId)
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
 
-    dfR = fabric.list_reports(workspace=workspace)
-    dfD = fabric.list_datasets(workspace=workspace)
+    dfR = fabric.list_reports(workspace=workspace_id)
+    dfD = fabric.list_datasets(workspace=workspace_id)
     dfR = pd.merge(
         dfR,
         dfD[["Dataset ID", "Dataset Name"]],
@@ -119,16 +126,16 @@ def report_dependency_tree(workspace: Optional[str] = None):
     dfR.rename(columns={"Name": "Report Name"}, inplace=True)
     dfR = dfR[["Report Name", "Dataset Name"]]
 
-    report_icon = "\U0001F4F6"
-    dataset_icon = "\U0001F9CA"
-    workspace_icon = "\U0001F465"
+    report_icon = "\U0001f4f6"
+    dataset_icon = "\U0001f9ca"
+    workspace_icon = "\U0001f465"
 
     node_dict = {}
-    rootNode = Node(workspace)
-    node_dict[workspace] = rootNode
+    rootNode = Node(workspace_name)
+    node_dict[workspace_name] = rootNode
     rootNode.custom_property = f"{workspace_icon} "
 
-    for i, r in dfR.iterrows():
+    for _, r in dfR.iterrows():
         datasetName = r["Dataset Name"]
         reportName = r["Report Name"]
         parentNode = node_dict.get(datasetName)
@@ -141,263 +148,15 @@ def report_dependency_tree(workspace: Optional[str] = None):
         child_node.custom_property = f"{report_icon} "
 
     # Print the tree structure
-    for pre, _, node in RenderTree(node_dict[workspace]):
+    for pre, _, node in RenderTree(node_dict[workspace_name]):
         print(f"{pre}{node.custom_property}'{node.name}'")
 
 
 @log
-def export_report(
-    report: str,
-    export_format: str,
-    file_name: Optional[str] = None,
-    bookmark_name: Optional[str] = None,
-    page_name: Optional[str] = None,
-    visual_name: Optional[str] = None,
-    report_filter: Optional[str] = None,
-    workspace: Optional[str] = None,
-):
-    """
-    Exports a Power BI report to a file in your lakehouse.
-
-    This is a wrapper function for the following APIs: `Reports - Export To File In Group <https://learn.microsoft.com/rest/api/power-bi/reports/export-to-file-in-group>`_, `Reports - Get Export To File Status In Group <https://learn.microsoft.com/rest/api/power-bi/reports/get-export-to-file-status-in-group>`_, `Reports - Get File Of Export To File In Group <https://learn.microsoft.com/rest/api/power-bi/reports/get-file-of-export-to-file-in-group>`_.
-
-    Parameters
-    ----------
-    report : str
-        Name of the Power BI report.
-    export_format : str
-        The format in which to export the report. For image formats, enter the file extension in this parameter, not 'IMAGE'.
-        `Valid formats <https://learn.microsoft.com/rest/api/power-bi/reports/export-to-file-in-group#fileformat>`_
-    file_name : str, default=None
-        The name of the file to be saved within the lakehouse. Do not include the file extension. Defaults ot the reportName parameter value.
-    bookmark_name : str, default=None
-        The name (GUID) of a bookmark within the report.
-    page_name : str, default=None
-        The name (GUID) of the report page.
-    visual_name : str, default=None
-        The name (GUID) of a visual. If you specify this parameter you must also specify the page_name parameter.
-    report_filter : str, default=None
-        A report filter to be applied when exporting the report. Syntax is user-friendly. See above for examples.
-    workspace : str, default=None
-        The Fabric workspace name.
-        Defaults to None which resolves to the workspace of the attached lakehouse
-        or if no lakehouse attached, resolves to the workspace of the notebook.
-    """
-
-    # https://learn.microsoft.com/rest/api/power-bi/reports/export-to-file-in-group
-    # https://learn.microsoft.com/rest/api/power-bi/reports/get-export-to-file-status-in-group
-    # https://learn.microsoft.com/rest/api/power-bi/reports/get-file-of-export-to-file-in-group
-
-    if not lakehouse_attached():
-        raise ValueError(
-            f"{icons.red_dot} In order to run the 'export_report' function, a lakehouse must be attached to the notebook. Please attach a lakehouse to this notebook."
-        )
-
-    (workspace, workspace_id) = resolve_workspace_name_and_id(workspace)
-
-    if isinstance(page_name, str):
-        page_name = [page_name]
-    if isinstance(visual_name, str):
-        visual_name = [visual_name]
-
-    if bookmark_name is not None and (page_name is not None or visual_name is not None):
-        raise ValueError(
-            f"{icons.red_dot} If the 'bookmark_name' parameter is set, the 'page_name' and 'visual_name' parameters must not be set."
-        )
-
-    if visual_name is not None and page_name is None:
-        raise ValueError(
-            f"{icons.red_dot} If the 'visual_name' parameter is set, the 'page_name' parameter must be set."
-        )
-
-    validFormats = {
-        "ACCESSIBLEPDF": ".pdf",
-        "CSV": ".csv",
-        "DOCX": ".docx",
-        "MHTML": ".mhtml",
-        "PDF": ".pdf",
-        "PNG": ".png",
-        "PPTX": ".pptx",
-        "XLSX": ".xlsx",
-        "XML": ".xml",
-        "BMP": ".bmp",
-        "EMF": ".emf",
-        "GIF": ".gif",
-        "JPEG": ".jpeg",
-        "TIFF": ".tiff",
-    }
-
-    export_format = export_format.upper()
-    fileExt = validFormats.get(export_format)
-    if fileExt is None:
-        raise ValueError(
-            f"{icons.red_dot} The '{export_format}' format is not a valid format for exporting Power BI reports. Please enter a valid format. Options: {validFormats}"
-        )
-
-    if file_name is None:
-        file_name = f"{report}{fileExt}"
-    else:
-        file_name = f"{file_name}{fileExt}"
-
-    folderPath = "/lakehouse/default/Files"
-    filePath = os.path.join(folderPath, file_name)
-
-    dfI = fabric.list_items(workspace=workspace)
-    dfI_filt = dfI[
-        (dfI["Type"].isin(["Report", "PaginatedReport"]))
-        & (dfI["Display Name"] == report)
-    ]
-
-    if len(dfI_filt) == 0:
-        raise ValueError(
-            f"{icons.red_dot} The '{report}' report does not exist in the '{workspace}' workspace."
-        )
-
-    reportType = dfI_filt["Type"].iloc[0]
-
-    # Limitations
-    pbiOnly = ["PNG"]
-    paginatedOnly = [
-        "ACCESSIBLEPDF",
-        "CSV",
-        "DOCX",
-        "BMP",
-        "EMF",
-        "GIF",
-        "JPEG",
-        "TIFF",
-        "MHTML",
-        "XLSX",
-        "XML",
-    ]
-
-    if reportType == "Report" and export_format in paginatedOnly:
-        raise ValueError(
-            f"{icons.red_dot} The '{export_format}' format is only supported for paginated reports."
-        )
-
-    if reportType == "PaginatedReport" and export_format in pbiOnly:
-        raise ValueError(
-            f"{icons.red_dot} The '{export_format}' format is only supported for Power BI reports."
-        )
-
-    if reportType == "PaginatedReport" and (
-        bookmark_name is not None or page_name is not None or visual_name is not None
-    ):
-        raise ValueError(
-            f"{icons.red_dot} Export for paginated reports does not support bookmarks/pages/visuals. Those parameters must not be set for paginated reports."
-        )
-
-    reportId = dfI_filt["Id"].iloc[0]
-    client = fabric.PowerBIRestClient()
-
-    if (
-        export_format in ["BMP", "EMF", "GIF", "JPEG", "TIFF"]
-        and reportType == "PaginatedReport"
-    ):
-        request_body = {
-            "format": "IMAGE",
-            "paginatedReportConfiguration": {
-                "formatSettings": {"OutputFormat": export_format.lower()}
-            },
-        }
-    elif bookmark_name is None and page_name is None and visual_name is None:
-        request_body = {"format": export_format}
-    elif bookmark_name is not None:
-        if reportType == "Report":
-            request_body = {
-                "format": export_format,
-                "powerBIReportConfiguration": {
-                    "defaultBookmark": {"name": bookmark_name}
-                },
-            }
-    elif page_name is not None and visual_name is None:
-        if reportType == "Report":
-            request_body = {"format": export_format, "powerBIReportConfiguration": {}}
-
-            request_body["powerBIReportConfiguration"]["pages"] = []
-            dfPage = list_report_pages(report=report, workspace=workspace)
-
-            for page in page_name:
-                dfPage_filt = dfPage[dfPage["Page ID"] == page]
-                if len(dfPage_filt) == 0:
-                    raise ValueError(
-                        f"{icons.red_dot} The '{page}' page does not exist in the '{report}' report within the '{workspace}' workspace."
-                    )
-
-                page_dict = {"pageName": page}
-                request_body["powerBIReportConfiguration"]["pages"].append(page_dict)
-
-    elif page_name is not None and visual_name is not None:
-        if len(page_name) != len(visual_name):
-            raise ValueError(
-                f"{icons.red_dot} Each 'visual_name' must map to a single 'page_name'."
-            )
-
-        if reportType == "Report":
-            request_body = {"format": export_format, "powerBIReportConfiguration": {}}
-
-            request_body["powerBIReportConfiguration"]["pages"] = []
-            dfVisual = list_report_visuals(report=report, workspace=workspace)
-            a = 0
-            for page in page_name:
-                visual = visual_name[a]
-
-                dfVisual_filt = dfVisual[
-                    (dfVisual["Page ID"] == page) & (dfVisual["Visual ID"] == visual)
-                ]
-                if len(dfVisual_filt) == 0:
-                    raise ValueError(
-                        f"{icons.red_dot} The '{visual}' visual does not exist on the '{page}' in the '{report}' report within the '{workspace}' workspace."
-                    )
-
-                page_dict = {"pageName": page, "visualName": visual}
-                request_body["powerBIReportConfiguration"]["pages"].append(page_dict)
-                a += 1
-
-    # Transform and add report filter if it is specified
-    if report_filter is not None and reportType == "Report":
-        reportFilter = generate_embedded_filter(filter=report_filter)
-        report_level_filter = {"filter": reportFilter}
-
-        if "powerBIReportConfiguration" not in request_body:
-            request_body["powerBIReportConfiguration"] = {}
-        request_body["powerBIReportConfiguration"]["reportLevelFilters"] = [
-            report_level_filter
-        ]
-
-    base_url = f"/v1.0/myorg/groups/{workspace_id}/reports/{reportId}"
-    response = client.post(f"{base_url}/ExportTo", json=request_body)
-
-    if response.status_code == 202:
-        response_body = json.loads(response.content)
-        export_id = response_body["id"]
-        response = client.get(f"{base_url}/exports/{export_id}")
-        response_body = json.loads(response.content)
-        while response_body["status"] not in ["Succeeded", "Failed"]:
-            time.sleep(3)
-            response = client.get(f"{base_url}/exports/{export_id}")
-            response_body = json.loads(response.content)
-        if response_body["status"] == "Failed":
-            raise ValueError(
-                f"{icons.red_dot} The export for the '{report}' report within the '{workspace}' workspace in the '{export_format}' format has failed."
-            )
-        else:
-            response = client.get(f"{base_url}/exports/{export_id}/file")
-            print(
-                f"{icons.in_progress} Saving the '{export_format}' export for the '{report}' report within the '{workspace}' workspace to the lakehouse..."
-            )
-            with open(filePath, "wb") as export_file:
-                export_file.write(response.content)
-            print(
-                f"{icons.green_dot} The '{export_format}' export for the '{report}' report within the '{workspace}' workspace has been saved to the following location: '{filePath}'."
-            )
-
-
 def clone_report(
     report: str,
     cloned_report: str,
-    workspace: Optional[str] = None,
+    workspace: Optional[str | UUID] = None,
     target_workspace: Optional[str] = None,
     target_dataset: Optional[str] = None,
     target_dataset_workspace: Optional[str] = None,
@@ -413,8 +172,8 @@ def clone_report(
         Name of the Power BI report.
     cloned_report : str
         Name of the new Power BI report.
-    workspace : str, default=None
-        The Fabric workspace name.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
     target_workspace : str, default=None
@@ -425,60 +184,56 @@ def clone_report(
         The name of the semantic model to be used by the cloned report.
         Defaults to None which resolves to the semantic model used by the initial report.
     target_dataset_workspace : str, default=None
-        The workspace in which the semantic model to be used by the report resides.
+        The workspace name in which the semantic model to be used by the report resides.
         Defaults to None which resolves to the semantic model used by the initial report.
     """
 
-    # https://learn.microsoft.com/rest/api/power-bi/reports/clone-report-in-group
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
 
-    (workspace, workspace_id) = resolve_workspace_name_and_id(workspace)
-
-    dfI = fabric.list_items(workspace=workspace, type="Report")
+    dfI = fabric.list_items(workspace=workspace_id, type="Report")
     dfI_filt = dfI[(dfI["Display Name"] == report)]
 
     if len(dfI_filt) == 0:
         raise ValueError(
-            f"{icons.red_dot} The '{report}' report does not exist within the '{workspace}' workspace."
+            f"{icons.red_dot} The '{report}' report does not exist within the '{workspace_name}' workspace."
         )
 
-    reportId = resolve_report_id(report, workspace)
+    reportId = resolve_report_id(report, workspace_id)
 
     if target_workspace is None:
-        target_workspace = workspace
+        target_workspace = workspace_name
         target_workspace_id = workspace_id
     else:
-        target_workspace_id = fabric.resolve_workspace_id(target_workspace)
+        target_workspace_id = resolve_workspace_id(workspace=target_workspace)
 
     if target_dataset is not None:
         if target_dataset_workspace is None:
-            target_dataset_workspace = workspace
+            target_dataset_workspace = workspace_name
         target_dataset_id = resolve_dataset_id(target_dataset, target_dataset_workspace)
 
-    if report == cloned_report and workspace == target_workspace:
+    if report == cloned_report and workspace_name == target_workspace:
         raise ValueError(
-            f"{icons.warning} The 'report' and 'cloned_report' parameters have the same value of '{report}. The 'workspace' and 'target_workspace' have the same value of '{workspace}'. Either the 'cloned_report' or the 'target_workspace' must be different from the original report."
+            f"{icons.warning} The 'report' and 'cloned_report' parameters have the same value of '{report}. The 'workspace' and 'target_workspace' have the same value of '{workspace_name}'. Either the 'cloned_report' or the 'target_workspace' must be different from the original report."
         )
 
-    client = fabric.PowerBIRestClient()
-
-    request_body = {"name": cloned_report}
+    payload = {"name": cloned_report}
     if target_dataset is not None:
-        request_body["targetModelId"] = target_dataset_id
-    if target_workspace != workspace:
-        request_body["targetWorkspaceId"] = target_workspace_id
+        payload["targetModelId"] = target_dataset_id
+    if target_workspace != workspace_name:
+        payload["targetWorkspaceId"] = target_workspace_id
 
-    response = client.post(
-        f"/v1.0/myorg/groups/{workspace_id}/reports/{reportId}/Clone", json=request_body
+    _base_api(
+        request=f"/v1.0/myorg/groups/{workspace_id}/reports/{reportId}/Clone",
+        method="post",
+        payload=payload,
     )
-
-    if response.status_code != 200:
-        raise FabricHTTPException(response)
     print(
         f"{icons.green_dot} The '{report}' report has been successfully cloned as the '{cloned_report}' report within the '{target_workspace}' workspace."
     )
 
 
-def launch_report(report: str, workspace: Optional[str] = None):
+@log
+def launch_report(report: str, workspace: Optional[str | UUID] = None):
     """
     Shows a Power BI report within a Fabric notebook.
 
@@ -486,8 +241,8 @@ def launch_report(report: str, workspace: Optional[str] = None):
     ----------
     report : str
         Name of the Power BI report.
-    workspace : str, default=None
-        The Fabric workspace name.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
 
@@ -499,16 +254,15 @@ def launch_report(report: str, workspace: Optional[str] = None):
 
     from sempy_labs import resolve_report_id
 
-    (workspace, workspace_id) = resolve_workspace_name_and_id(workspace)
-
-    reportId = resolve_report_id(report, workspace)
-
-    report = Report(group_id=workspace_id, report_id=reportId)
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
+    report_id = resolve_report_id(report, workspace_id)
+    report = Report(group_id=workspace_id, report_id=report_id)
 
     return report
 
 
-def list_report_pages(report: str, workspace: Optional[str] = None):
+@log
+def list_report_pages(report: str, workspace: Optional[str | UUID] = None):
     """
     Shows the properties of all pages within a Power BI report.
 
@@ -516,8 +270,8 @@ def list_report_pages(report: str, workspace: Optional[str] = None):
     ----------
     report : str
         Name of the Power BI report.
-    workspace : str, default=None
-        The Fabric workspace name.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
 
@@ -527,15 +281,13 @@ def list_report_pages(report: str, workspace: Optional[str] = None):
         A pandas dataframe showing the pages within a Power BI report and their properties.
     """
 
-    if workspace is None:
-        workspace_id = fabric.get_workspace_id()
-        workspace = fabric.resolve_workspace_name(workspace_id)
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
 
     df = pd.DataFrame(
         columns=["Page ID", "Page Name", "Hidden", "Width", "Height", "Visual Count"]
     )
 
-    reportJson = get_report_json(report=report, workspace=workspace)
+    reportJson = get_report_json(report=report, workspace=workspace_id)
 
     for section in reportJson["sections"]:
         pageID = section.get("name")
@@ -565,14 +317,20 @@ def list_report_pages(report: str, workspace: Optional[str] = None):
         }
         df = pd.concat([df, pd.DataFrame(new_data, index=[0])], ignore_index=True)
 
-    df["Hidden"] = df["Hidden"].astype(bool)
-    intCol = ["Width", "Height", "Visual Count"]
-    df[intCol] = df[intCol].astype(int)
+    column_map = {
+        "Hidden": "bool",
+        "Width": "int",
+        "Height": "int",
+        "Visual Count": "int",
+    }
+
+    _update_dataframe_datatypes(dataframe=df, column_map=column_map)
 
     return df
 
 
-def list_report_visuals(report: str, workspace: Optional[str] = None):
+@log
+def list_report_visuals(report: str, workspace: Optional[str | UUID] = None):
     """
     Shows the properties of all visuals within a Power BI report.
 
@@ -580,8 +338,8 @@ def list_report_visuals(report: str, workspace: Optional[str] = None):
     ----------
     report : str
         Name of the Power BI report.
-    workspace : str, default=None
-        The Fabric workspace name.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
 
@@ -591,11 +349,9 @@ def list_report_visuals(report: str, workspace: Optional[str] = None):
         A pandas dataframe showing the visuals within a Power BI report and their properties.
     """
 
-    if workspace is None:
-        workspace_id = fabric.get_workspace_id()
-        workspace = fabric.resolve_workspace_name(workspace_id)
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
 
-    reportJson = get_report_json(report=report, workspace=workspace)
+    reportJson = get_report_json(report=report, workspace=workspace_id)
 
     df = pd.DataFrame(columns=["Page Name", "Page ID", "Visual ID", "Title"])
 
@@ -627,7 +383,8 @@ def list_report_visuals(report: str, workspace: Optional[str] = None):
     return df
 
 
-def list_report_bookmarks(report: str, workspace: Optional[str] = None):
+@log
+def list_report_bookmarks(report: str, workspace: Optional[str | UUID] = None):
     """
     Shows the properties of all bookmarks within a Power BI report.
 
@@ -635,8 +392,8 @@ def list_report_bookmarks(report: str, workspace: Optional[str] = None):
     ----------
     report : str
         Name of the Power BI report.
-    workspace : str, default=None
-        The Fabric workspace name.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
 
@@ -646,9 +403,7 @@ def list_report_bookmarks(report: str, workspace: Optional[str] = None):
         A pandas dataframe showing the bookmarks within a Power BI report and their properties.
     """
 
-    if workspace is None:
-        workspace_id = fabric.get_workspace_id()
-        workspace = fabric.resolve_workspace_name(workspace_id)
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
 
     df = pd.DataFrame(
         columns=[
@@ -660,7 +415,7 @@ def list_report_bookmarks(report: str, workspace: Optional[str] = None):
         ]
     )
 
-    reportJson = get_report_json(report=report, workspace=workspace)
+    reportJson = get_report_json(report=report, workspace=workspace_id)
     reportConfig = reportJson["config"]
     reportConfigJson = json.loads(reportConfig)
 
@@ -693,7 +448,7 @@ def list_report_bookmarks(report: str, workspace: Optional[str] = None):
             }
             df = pd.concat([df, pd.DataFrame(new_data, index=[0])], ignore_index=True)
 
-        listPages = list_report_pages(report=report, workspace=workspace)
+        listPages = list_report_pages(report=report, workspace=workspace_id)
 
         df = pd.merge(df, listPages[["Page ID", "Page Name"]], on="Page ID", how="left")
         df = df[
@@ -711,13 +466,15 @@ def list_report_bookmarks(report: str, workspace: Optional[str] = None):
 
     except Exception:
         print(
-            f"The '{report}' report within the '{workspace}' workspace has no bookmarks."
+            f"The '{report}' report within the '{workspace_name}' workspace has no bookmarks."
         )
 
 
 @log
 def translate_report_titles(
-    report: str, languages: Union[str, List[str]], workspace: Optional[str] = None
+    report: str,
+    languages: Union[str, List[str]],
+    workspace: Optional[str | UUID] = None,
 ):
     """
     Dynamically generates new Power BI reports which have report titles translated into the specified language(s).
@@ -728,13 +485,14 @@ def translate_report_titles(
         Name of the Power BI report.
     languages : str, List[str]
         The language code(s) in which to translate the report titles.
-    workspace : str, default=None
-        The Fabric workspace name.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
     """
     from synapse.ml.services import Translate
-    from pyspark.sql import SparkSession
+
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
 
     if isinstance(languages, str):
         languages = [languages]
@@ -742,9 +500,9 @@ def translate_report_titles(
     for lang in languages:
         language_validate(lang)
 
-    reportJson = get_report_json(report=report, workspace=workspace)
-    dfV = list_report_visuals(report=report, workspace=workspace)
-    spark = SparkSession.builder.getOrCreate()
+    reportJson = get_report_json(report=report, workspace=workspace_id)
+    dfV = list_report_visuals(report=report, workspace=workspace_id)
+    spark = _create_spark_session()
     df = spark.createDataFrame(dfV)
     columnToTranslate = "Title"
 
@@ -771,7 +529,7 @@ def translate_report_titles(
         language = language_validate(lang)
         clonedReportName = f"{report}_{language}"
 
-        dfRep = fabric.list_reports(workspace=workspace)
+        dfRep = fabric.list_reports(workspace=workspace_id)
         dfRep_filt = dfRep[
             (dfRep["Name"] == clonedReportName)
             & (dfRep["Report Type"] == "PowerBIReport")
@@ -779,14 +537,14 @@ def translate_report_titles(
 
         if len(dfRep_filt) > 0:
             print(
-                f"{icons.yellow_dot} The '{clonedReportName}' report already exists in the '{workspace} workspace."
+                f"{icons.yellow_dot} The '{clonedReportName}' report already exists in the '{workspace_name} workspace."
             )
         else:
             clone_report(
-                report=report, cloned_report=clonedReportName, workspace=workspace
+                report=report, cloned_report=clonedReportName, workspace=workspace_id
             )
             print(
-                f"{icons.green_dot} The '{clonedReportName}' report has been created via clone in the '{workspace} workspace."
+                f"{icons.green_dot} The '{clonedReportName}' report has been created via clone in the '{workspace_name} workspace."
             )
 
         rptJsonTr = copy.deepcopy(reportJson)
@@ -816,8 +574,8 @@ def translate_report_titles(
 
         # Post updated report json file to cloned report
         update_report_from_reportjson(
-            report=clonedReportName, report_json=rptJsonTr, workspace=workspace
+            report=clonedReportName, report_json=rptJsonTr, workspace=workspace_id
         )
         print(
-            f"{icons.green_dot} The visual titles within the '{clonedReportName}' report within the '{workspace}' have been translated into '{language}' accordingly."
+            f"{icons.green_dot} The visual titles within the '{clonedReportName}' report within the '{workspace_name}' have been translated into '{language}' accordingly."
         )

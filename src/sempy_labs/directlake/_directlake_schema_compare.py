@@ -1,108 +1,114 @@
-import sempy.fabric as fabric
+import sempy
 import pandas as pd
-from sempy_labs._helper_functions import (
-    format_dax_object_name,
-)
+from uuid import UUID
 from IPython.display import display
-from sempy_labs.lakehouse import get_lakehouse_columns
-from sempy_labs.directlake._dl_helper import get_direct_lake_source
 from typing import Optional
-import sempy_labs._icons as icons
 from sempy._utils._log import log
+from sempy_labs._helper_functions import (
+    resolve_workspace_name_and_id,
+    resolve_dataset_name_and_id,
+)
+from sempy_labs.lakehouse._get_lakehouse_columns import get_lakehouse_columns
+import sempy_labs._icons as icons
+from sempy_labs.directlake._sources import get_direct_lake_sources
+from sempy_labs.tom import connect_semantic_model
 
 
 @log
 def direct_lake_schema_compare(
-    dataset: str,
-    workspace: Optional[str] = None,
-    **kwargs,
+    dataset: str | UUID,
+    workspace: Optional[str | UUID] = None,
 ):
     """
     Checks that all the tables in a Direct Lake semantic model map to tables in their corresponding lakehouse and that the columns in each table exist.
 
     Parameters
     ----------
-    dataset : str
-        Name of the semantic model.
-    workspace : str, default=None
-        The Fabric workspace name.
+    dataset : str | uuid.UUID
+        Name or ID of the semantic model.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
     """
 
-    if "lakehouse" in kwargs:
-        print(
-            "The 'lakehouse' parameter has been deprecated as it is no longer necessary. Please remove this parameter from the function going forward."
-        )
-        del kwargs["lakehouse"]
-    if "lakehouse_workspace" in kwargs:
-        print(
-            "The 'lakehouse_workspace' parameter has been deprecated as it is no longer necessary. Please remove this parameter from the function going forward."
-        )
-        del kwargs["lakehouse_workspace"]
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
+    (dataset_name, dataset_id) = resolve_dataset_name_and_id(dataset, workspace_id)
 
-    workspace = fabric.resolve_workspace_name(workspace)
+    sources = get_direct_lake_sources(dataset=dataset_id, workspace=workspace_id)[0]
 
-    artifact_type, lakehouse_name, lakehouse_id, lakehouse_workspace_id = (
-        get_direct_lake_source(dataset=dataset, workspace=workspace)
-    )
-    lakehouse_workspace = fabric.resolve_workspace_name(lakehouse_workspace_id)
+    source_type = sources.get("itemType")
 
-    if artifact_type == "Warehouse":
+    if source_type != "Lakehouse":
         raise ValueError(
-            f"{icons.red_dot} This function is only valid for Direct Lake semantic models which source from Fabric lakehouses (not warehouses)."
+            f"{icons.red_dot} The source of the '{dataset_name}' semantic model within the '{workspace_name}' workspace is not a Fabric lakehouse. This function only supports Direct Lake semantic models which source from Fabric lakehouses."
         )
 
-    dfP = fabric.list_partitions(dataset=dataset, workspace=workspace)
-
-    if not any(r["Mode"] == "DirectLake" for i, r in dfP.iterrows()):
-        raise ValueError(
-            f"{icons.red_dot} The '{dataset}' semantic model is not in Direct Lake mode."
-        )
-
-    dfT = fabric.list_tables(dataset=dataset, workspace=workspace)
-    dfC = fabric.list_columns(dataset=dataset, workspace=workspace)
-    lc = get_lakehouse_columns(lakehouse_name, lakehouse_workspace)
-
-    dfT.rename(columns={"Type": "Table Type"}, inplace=True)
-    dfP_filt = dfP[dfP["Mode"] == "DirectLake"]
-    dfC = pd.merge(dfC, dfP[["Table Name", "Query"]], on="Table Name", how="inner")
-    dfC = pd.merge(
-        dfC,
-        dfT[["Name", "Table Type"]],
-        left_on="Table Name",
-        right_on="Name",
-        how="inner",
+    lakehouse_name = sources.get("itemName")
+    lakehouse_id = sources.get("itemId")
+    lakehouse_workspace_id = sources.get("workspaceId")
+    lakehouse_workspace_name = sources.get("workspaceName")
+    df_lake = get_lakehouse_columns(
+        lakehouse=lakehouse_id, workspace=lakehouse_workspace_id
     )
-    dfC["Full Column Name"] = format_dax_object_name(dfC["Query"], dfC["Source"])
-    dfC_filt = dfC[dfC["Table Type"] == "Table"]
-    # Schema compare
-    missingtbls = dfP_filt[~dfP_filt["Query"].isin(lc["Table Name"])]
-    missingtbls = missingtbls[["Table Name", "Query"]]
-    missingtbls.rename(columns={"Query": "Source Table"}, inplace=True)
-    missingcols = dfC_filt[~dfC_filt["Full Column Name"].isin(lc["Full Column Name"])]
-    missingcols = missingcols[
-        ["Table Name", "Column Name", "Type", "Data Type", "Source"]
-    ]
-    missingcols.rename(columns={"Source": "Source Column"}, inplace=True)
 
-    if len(missingtbls) == 0:
-        print(
-            f"{icons.green_dot} All tables exist in the '{lakehouse_name}' lakehouse within the '{lakehouse_workspace}' workspace."
-        )
-    else:
-        print(
-            f"{icons.yellow_dot} The following tables exist in the '{dataset}' semantic model within the '{workspace}' workspace"
-            f" but do not exist in the '{lakehouse_name}' lakehouse within the '{lakehouse_workspace}' workspace."
-        )
-        display(missingtbls)
-    if len(missingcols) == 0:
-        print(
-            f"{icons.green_dot} All columns exist in the '{lakehouse_name}' lakehouse within the '{lakehouse_workspace}' workspace."
-        )
-    else:
-        print(
-            f"{icons.yellow_dot} The following columns exist in the '{dataset}' semantic model within the '{workspace}' workspace "
-            f"but do not exist in the '{lakehouse_name}' lakehouse within the '{lakehouse_workspace}' workspace."
-        )
-        display(missingcols)
+    sempy.fabric._client._utils._init_analysis_services()
+    import Microsoft.AnalysisServices.Tabular as TOM
+
+    with connect_semantic_model(dataset=dataset_id, workspace=workspace_id) as tom:
+        if tom.is_direct_lake is False:
+            raise ValueError(
+                f"{icons.red_dot} The '{dataset_name}' semantic model within the '{workspace_name}' workspace is not in Direct Lake mode."
+            )
+        missing_tables = []
+        missing_columns = []
+        for p in tom.all_partitions():
+            if p.Mode == TOM.ModeType.DirectLake:
+                table_name = p.Parent.Name
+                source_table = p.Source.EntityName
+                df_lake_filt = df_lake[df_lake["Table Name"] == source_table]
+                if df_lake_filt.empty:
+                    missing_tables.append(
+                        {
+                            "Table Name": table_name,
+                            "Source Table": source_table,
+                        }
+                    )
+                else:
+                    for c in p.Parent.Columns:
+                        col_name = c.Name
+                        source_col = c.SourceColumn
+                        df_lake_filt = df_lake[
+                            (df_lake["Table Name"] == source_table)
+                            & (df_lake["Column Name"] == source_col)
+                        ]
+                        if df_lake_filt.empty:
+                            missing_columns.append(
+                                {
+                                    "Table Name": table_name,
+                                    "Source Table": source_table,
+                                    "Column Name": col_name,
+                                    "Source Column": source_col,
+                                }
+                            )
+
+        if len(missing_tables) == 0:
+            print(
+                f"{icons.green_dot} All tables exist in the '{lakehouse_name}' lakehouse within the '{lakehouse_workspace_name}' workspace."
+            )
+        else:
+            print(
+                f"{icons.yellow_dot} The following tables exist in the '{dataset_name}' semantic model within the '{workspace_name}' workspace"
+                f" but do not exist in the '{lakehouse_name}' lakehouse within the '{lakehouse_workspace_name}' workspace."
+            )
+            display(pd.DataFrame(missing_tables))
+        if len(missing_columns) == 0:
+            print(
+                f"{icons.green_dot} All columns exist in the '{lakehouse_name}' lakehouse within the '{lakehouse_workspace_name}' workspace."
+            )
+        else:
+            print(
+                f"{icons.yellow_dot} The following columns exist in the '{dataset_name}' semantic model within the '{workspace_name}' workspace "
+                f"but do not exist in the '{lakehouse_name}' lakehouse within the '{lakehouse_workspace_name}' workspace."
+            )
+            display(pd.DataFrame(missing_columns))

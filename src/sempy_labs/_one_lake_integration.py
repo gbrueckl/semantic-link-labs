@@ -2,14 +2,19 @@ import sempy.fabric as fabric
 import pandas as pd
 from typing import Optional
 from sempy._utils._log import log
-from sempy_labs._helper_functions import resolve_workspace_name_and_id
+from sempy_labs._helper_functions import (
+    resolve_workspace_name_and_id,
+    resolve_dataset_name_and_id,
+    resolve_workspace_id,
+)
 import sempy_labs._icons as icons
+from uuid import UUID
 
 
 @log
 def export_model_to_onelake(
-    dataset: str,
-    workspace: Optional[str] = None,
+    dataset: str | UUID,
+    workspace: Optional[str | UUID] = None,
     destination_lakehouse: Optional[str] = None,
     destination_workspace: Optional[str] = None,
 ):
@@ -18,10 +23,10 @@ def export_model_to_onelake(
 
     Parameters
     ----------
-    dataset : str
-        Name of the semantic model.
-    workspace : str, default=None
-        The Fabric workspace name.
+    dataset : str | uuid.UUID
+        Name or ID of the semantic model.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
     destination_lakehouse : str, default=None
@@ -30,21 +35,16 @@ def export_model_to_onelake(
         The name of the Fabric workspace in which the lakehouse resides.
     """
 
-    (workspace, workspace_id) = resolve_workspace_name_and_id(workspace)
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
+    (dataset_name, dataset_id) = resolve_dataset_name_and_id(dataset, workspace_id)
+
+    fabric.refresh_tom_cache(workspace=workspace)
 
     if destination_workspace is None:
-        destination_workspace = workspace
+        destination_workspace = workspace_name
         destination_workspace_id = workspace_id
     else:
-        destination_workspace_id = fabric.resolve_workspace_id(destination_workspace)
-
-    dfD = fabric.list_datasets(workspace=workspace)
-    dfD_filt = dfD[dfD["Dataset Name"] == dataset]
-
-    if len(dfD_filt) == 0:
-        raise ValueError(
-            f"{icons.red_dot} The '{dataset}' semantic model does not exist in the '{workspace}' workspace."
-        )
+        destination_workspace_id = resolve_workspace_id(workspace=destination_workspace)
 
     tmsl = f"""
     {{
@@ -53,7 +53,7 @@ def export_model_to_onelake(
     'type': 'full',
     'objects': [
         {{
-        'database': '{dataset}'
+        'database': '{dataset_name}'
         }}
     ]
     }}
@@ -62,13 +62,13 @@ def export_model_to_onelake(
 
     # Export model's tables as delta tables
     try:
-        fabric.execute_tmsl(script=tmsl, workspace=workspace)
+        fabric.execute_tmsl(script=tmsl, workspace=workspace_id)
         print(
-            f"{icons.green_dot} The '{dataset}' semantic model's tables have been exported as delta tables to the '{workspace}' workspace.\n"
+            f"{icons.green_dot} The '{dataset_name}' semantic model's tables have been exported as delta tables to the '{workspace_name}' workspace.\n"
         )
     except Exception as e:
         raise ValueError(
-            f"{icons.red_dot} The '{dataset}' semantic model's tables have not been exported as delta tables to the '{workspace}' workspace.\nMake sure you enable OneLake integration for the '{dataset}' semantic model. Follow the instructions here: https://learn.microsoft.com/power-bi/enterprise/onelake-integration-overview#enable-onelake-integration"
+            f"{icons.red_dot} The '{dataset_name}' semantic model's tables have not been exported as delta tables to the '{workspace_name}' workspace.\nMake sure you enable OneLake integration for the '{dataset_name}' semantic model. Follow the instructions here: https://learn.microsoft.com/power-bi/enterprise/onelake-integration-overview#enable-onelake-integration"
         ) from e
 
     # Create shortcuts if destination lakehouse is specified
@@ -92,14 +92,14 @@ def export_model_to_onelake(
             destination_lakehouse_id = dfI_filt["Id"].iloc[0]
 
         # Source...
-        dfI_Source = fabric.list_items(workspace=workspace, type="SemanticModel")
+        dfI_Source = fabric.list_items(workspace=workspace_id, type="SemanticModel")
         dfI_filtSource = dfI_Source[(dfI_Source["Display Name"] == dataset)]
         sourceLakehouseId = dfI_filtSource["Id"].iloc[0]
 
         # Valid tables
         dfP = fabric.list_partitions(
-            dataset=dataset,
-            workspace=workspace,
+            dataset=dataset_id,
+            workspace=workspace_id,
             additional_xmla_properties=["Parent.SystemManaged"],
         )
         dfP_filt = dfP[
@@ -107,7 +107,7 @@ def export_model_to_onelake(
             & (dfP["Source Type"] != "CalculationGroup")
             & (dfP["Parent System Managed"] == False)
         ]
-        dfC = fabric.list_columns(dataset=dataset, workspace=workspace)
+        dfC = fabric.list_columns(dataset=dataset_id, workspace=workspace_id)
         tmc = pd.DataFrame(dfP.groupby("Table Name")["Mode"].nunique()).reset_index()
         oneMode = tmc[tmc["Mode"] == 1]
         tableAll = dfP_filt[
@@ -141,7 +141,7 @@ def export_model_to_onelake(
                 )
                 if response.status_code == 201:
                     print(
-                        f"{icons.bullet} The shortcut '{shortcutName}' was created in the '{destination_lakehouse}' lakehouse within the '{destination_workspace}' workspace. It is based on the '{tableName}' table in the '{dataset}' semantic model within the '{workspace}' workspace.\n"
+                        f"{icons.bullet} The shortcut '{shortcutName}' was created in the '{destination_lakehouse}' lakehouse within the '{destination_workspace}' workspace. It is based on the '{tableName}' table in the '{dataset_name}' semantic model within the '{workspace_name}' workspace.\n"
                     )
                 else:
                     print(response.status_code)

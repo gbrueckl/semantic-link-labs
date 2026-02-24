@@ -1,11 +1,17 @@
-import sempy.fabric as fabric
 import pandas as pd
 from typing import Optional
 import sempy_labs._icons as icons
-from sempy.fabric.exceptions import FabricHTTPException
+from sempy_labs._helper_functions import (
+    _update_dataframe_datatypes,
+    _base_api,
+    _create_dataframe,
+)
+from uuid import UUID
+from sempy._utils._log import log
 
 
-def list_workloads(capacity_name: str) -> pd.DataFrame:
+@log
+def list_workloads(capacity: str | UUID, **kwargs) -> pd.DataFrame:
     """
     Returns the current state of the specified capacity workloads.
     If a workload is enabled, the percentage of maximum memory that the workload can consume is also returned.
@@ -14,8 +20,8 @@ def list_workloads(capacity_name: str) -> pd.DataFrame:
 
     Parameters
     ----------
-    capacity_name : str
-        The capacity name.
+    capacity : str | uuid.UUID
+        The capacity name or ID.
 
     Returns
     -------
@@ -25,17 +31,22 @@ def list_workloads(capacity_name: str) -> pd.DataFrame:
 
     from sempy_labs._helper_functions import resolve_capacity_id
 
-    df = pd.DataFrame(
-        columns=["Workload Name", "State", "Max Memory Percentage Set By User"]
-    )
+    if "capacity_name" in kwargs:
+        capacity = kwargs["capacity_name"]
+        print(
+            f"{icons.warning} The 'capacity_name' parameter is deprecated. Please use 'capacity' instead."
+        )
 
-    capacity_id = resolve_capacity_id(capacity_name=capacity_name)
+    columns = {
+        "Workload Name": "string",
+        "State": "string",
+        "Max Memory Percentage Set By User": "int",
+    }
+    df = _create_dataframe(columns=columns)
 
-    client = fabric.PowerBIRestClient()
-    response = client.get(f"/v1.0/myorg/capacities/{capacity_id}/Workloads")
+    capacity_id = resolve_capacity_id(capacity=capacity)
 
-    if response.status_code != 200:
-        raise FabricHTTPException(response)
+    response = _base_api(request=f"/v1.0/myorg/capacities/{capacity_id}/Workloads")
 
     for v in response.json().get("value", []):
         new_data = {
@@ -45,17 +56,18 @@ def list_workloads(capacity_name: str) -> pd.DataFrame:
         }
         df = pd.concat([df, pd.DataFrame(new_data, index=[0])], ignore_index=True)
 
-    int_cols = ["Max Memory Percentage Set By User"]
-    df[int_cols] = df[int_cols].astype(int)
+    _update_dataframe_datatypes(dataframe=df, column_map=columns)
 
     return df
 
 
+@log
 def patch_workload(
-    capacity_name: str,
+    capacity: str | UUID,
     workload_name: str,
     state: Optional[str] = None,
     max_memory_percentage: Optional[int] = None,
+    **kwargs,
 ):
     """
     Changes the state of a specific workload to Enabled or Disabled.
@@ -65,8 +77,8 @@ def patch_workload(
 
     Parameters
     ----------
-    capacity_name : str
-        The capacity name.
+    capacity : str | uuid.UUID
+        The capacity name or ID.
     workload_name : str
         The workload name.
     state : str, default=None
@@ -77,7 +89,13 @@ def patch_workload(
 
     from sempy_labs._helper_functions import resolve_capacity_id
 
-    capacity_id = resolve_capacity_id(capacity_name=capacity_name)
+    if "capacity_name" in kwargs:
+        capacity = kwargs["capacity_name"]
+        print(
+            f"{icons.warning} The 'capacity_name' parameter is deprecated. Please use 'capacity' instead."
+        )
+
+    capacity_id = resolve_capacity_id(capacity=capacity)
 
     states = ["Disabled", "Enabled", "Unsupported"]
     state = state.capitalize()
@@ -92,12 +110,9 @@ def patch_workload(
             f"{icons.red_dot} Invalid max memory percentage. Must be a value between 0-100."
         )
 
-    client = fabric.PowerBIRestClient()
     url = f"/v1.0/myorg/capacities/{capacity_id}/Workloads/{workload_name}"
-    get_response = client.get(url)
-    if get_response.status_code != 200:
-        raise FabricHTTPException(get_response)
 
+    get_response = _base_api(request=url)
     get_json = get_response.json().get("value")
     current_state = get_json.get("state")
     current_max_memory = get_json.get("maxMemoryPercentageSetByUser")
@@ -118,11 +133,8 @@ def patch_workload(
     else:
         payload["maxMemoryPercentageSetByUser"] = current_max_memory
 
-    response = client.patch(url, json=payload)
-
-    if response.status_code != 200:
-        raise FabricHTTPException(response)
+    _base_api(request=url, method="patch", payload=payload)
 
     print(
-        f"The '{workload_name}' workload within the '{capacity_name}' capacity has been updated accordingly."
+        f"The '{workload_name}' workload within the '{capacity}' capacity has been updated accordingly."
     )

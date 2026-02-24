@@ -2,8 +2,10 @@ import sempy
 import pandas as pd
 import re
 from typing import Optional
+from sempy._utils._log import log
 
 
+@log
 def model_bpa_rules(
     dependencies: Optional[pd.DataFrame] = None,
     **kwargs,
@@ -64,7 +66,7 @@ def model_bpa_rules(
                     obj.FromCardinality == TOM.RelationshipEndCardinality.Many
                     and obj.ToCardinality == TOM.RelationshipEndCardinality.Many
                 )
-                or str(obj.CrossFilteringBehavior) == "BothDirections"
+                or str(obj.CrossFilteringBehavior) == "BothDirections",
                 "Bi-directional and many-to-many relationships may cause performance degradation or even have unintended consequences. Make sure to check these specific relationships to ensure they are working as designed and are actually necessary.",
                 "https://www.sqlbi.com/articles/bidirectional-relationships-and-ambiguity-in-dax",
             ),
@@ -402,8 +404,8 @@ def model_bpa_rules(
                 lambda obj, tom: tom.is_direct_lake() is False
                 and obj.IsAvailableInMDX is False
                 and (
-                    tom.used_in_sort_by(column=obj)
-                    or tom.used_in_hierarchies(column=obj)
+                    any(tom.used_in_sort_by(column=obj))
+                    or any(tom.used_in_hierarchies(column=obj))
                     or obj.SortByColumn is not None
                 ),
                 "In order to avoid errors, ensure that attribute hierarchies are enabled if a column is used for sorting another column, used in a hierarchy, used in variations, or is sorted by another column. The IsAvailableInMdx property is not relevant for Direct Lake models.",
@@ -416,7 +418,7 @@ def model_bpa_rules(
                 lambda obj, tom: any(
                     re.search(
                         r"USERELATIONSHIP\s*\(\s*.+?(?=])\]\s*,\s*'*"
-                        + obj.Name
+                        + re.escape(obj.Name)
                         + r"'*\[",
                         m.Expression,
                         flags=re.IGNORECASE,
@@ -455,7 +457,9 @@ def model_bpa_rules(
                 "Warning",
                 "The EVALUATEANDLOG function should not be used in production models",
                 lambda obj, tom: re.search(
-                    r"evaluateandlog\s*\(", obj.Expression, flags=re.IGNORECASE
+                    r"evaluateandlog\s*\(",
+                    obj.Expression,
+                    flags=re.IGNORECASE,
                 ),
                 "The EVALUATEANDLOG function is meant to be used only in development/test environments and should not be used in production models.",
                 "https://pbidax.wordpress.com/2022/08/16/introduce-the-dax-evaluateandlog-function",
@@ -554,7 +558,7 @@ def model_bpa_rules(
                 "Warning",
                 "Use the DIVIDE function for division",
                 lambda obj, tom: re.search(
-                    r"\]\s*\/(?!\/)(?!\*)\" or \"\)\s*\/(?!\/)(?!\*)",
+                    r"\]\s*\/(?!\/)(?!\*)|\)\s*\/(?!\/)(?!\*)",
                     obj.Expression,
                     flags=re.IGNORECASE,
                 ),
@@ -563,7 +567,12 @@ def model_bpa_rules(
             ),
             (
                 "DAX Expressions",
-                "Measure",
+                [
+                    "Measure",
+                    "Calculated Table",
+                    "Calculated Column",
+                    "Calculation Item",
+                ],
                 "Error",
                 "Column references should be fully qualified",
                 lambda obj, tom: any(
@@ -574,7 +583,12 @@ def model_bpa_rules(
             ),
             (
                 "DAX Expressions",
-                "Measure",
+                [
+                    "Measure",
+                    "Calculated Table",
+                    "Calculated Column",
+                    "Calculation Item",
+                ],
                 "Error",
                 "Measure references should be unqualified",
                 lambda obj, tom: any(
@@ -592,13 +606,13 @@ def model_bpa_rules(
                 and not any(
                     re.search(
                         r"USERELATIONSHIP\s*\(\s*\'*"
-                        + obj.FromTable.Name
+                        + re.escape(obj.FromTable.Name)
                         + r"'*\["
-                        + obj.FromColumn.Name
+                        + re.escape(obj.FromColumn.Name)
                         + r"\]\s*,\s*'*"
-                        + obj.ToTable.Name
+                        + re.escape(obj.ToTable.Name)
                         + r"'*\["
-                        + obj.ToColumn.Name
+                        + re.escape(obj.ToColumn.Name)
                         + r"\]",
                         m.Expression,
                         flags=re.IGNORECASE,
@@ -662,8 +676,18 @@ def model_bpa_rules(
                 "Provide format string for 'Date' columns",
                 lambda obj, tom: (re.search(r"date", obj.Name, flags=re.IGNORECASE))
                 and (obj.DataType == TOM.DataType.DateTime)
-                and (obj.FormatString != "mm/dd/yyyy"),
-                'Columns of type "DateTime" that have "Month" in their names should be formatted as "mm/dd/yyyy".',
+                and (
+                    obj.FormatString.lower()
+                    not in [
+                        "mm/dd/yyyy",
+                        "mm-dd-yyyy",
+                        "dd/mm/yyyy",
+                        "dd-mm-yyyy",
+                        "yyyy-mm-dd",
+                        "yyyy/mm/dd",
+                    ]
+                ),
+                'Columns of type "DateTime" that have "Date" in their names should be formatted.',
             ),
             (
                 "Formatting",
@@ -684,7 +708,9 @@ def model_bpa_rules(
                 "Measure",
                 "Info",
                 "Provide format string for measures",
-                lambda obj, tom: obj.IsHidden is False and len(obj.FormatString) == 0,
+                lambda obj, tom: obj.IsHidden is False
+                and len(obj.FormatString) == 0
+                and not obj.FormatStringDefinition,
                 "Visible measures should have their format string property assigned.",
             ),
             (
@@ -777,7 +803,7 @@ def model_bpa_rules(
                 "Formatting",
                 "Column",
                 "Warning",
-                'Provide format string for "Month" columns',
+                "Provide format string for 'Month' columns",
                 lambda obj, tom: re.search(r"month", obj.Name, flags=re.IGNORECASE)
                 and obj.DataType == TOM.DataType.DateTime
                 and obj.FormatString != "MMMM yyyy",

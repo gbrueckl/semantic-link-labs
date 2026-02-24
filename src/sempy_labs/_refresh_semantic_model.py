@@ -1,31 +1,33 @@
 import sempy.fabric as fabric
 import time
 from sempy_labs._helper_functions import (
-    resolve_dataset_id,
     resolve_workspace_name_and_id,
     _get_partition_map,
     _process_and_display_chart,
+    resolve_dataset_name_and_id,
+    _update_dataframe_datatypes,
+    _base_api,
 )
 from typing import Any, List, Optional, Union
 from sempy._utils._log import log
 import sempy_labs._icons as icons
-from sempy.fabric.exceptions import FabricHTTPException
 import pandas as pd
 import warnings
 import ipywidgets as widgets
 import json
+from uuid import UUID
 
 
 @log
 def refresh_semantic_model(
-    dataset: str,
+    dataset: str | UUID,
     tables: Optional[Union[str, List[str]]] = None,
     partitions: Optional[Union[str, List[str]]] = None,
     refresh_type: str = "full",
     retry_count: int = 0,
     apply_refresh_policy: bool = True,
     max_parallelism: int = 10,
-    workspace: Optional[str] = None,
+    workspace: Optional[str | UUID] = None,
     visualize: bool = False,
     commit_mode: str = "transactional",
 ) -> pd.DataFrame | None:
@@ -34,8 +36,8 @@ def refresh_semantic_model(
 
     Parameters
     ----------
-    dataset : str
-        Name of the semantic model.
+    dataset : str | uuid.UUID
+        Name or ID of the semantic model.
     tables : str, List[str], default=None
         A string or a list of tables to refresh.
     partitions: str, List[str], default=None
@@ -50,8 +52,8 @@ def refresh_semantic_model(
         Determines the maximum number of threads that can run the processing commands in parallel.
         This value aligns with the MaxParallelism property that can be set in the TMSL Sequence command or by using other methods.
         Defaults to 10.
-    workspace : str, default=None
-        The Fabric workspace name.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
     visualize : bool, default=False
@@ -65,7 +67,8 @@ def refresh_semantic_model(
         If 'visualize' is set to True, returns a pandas dataframe showing the SSAS trace output used to generate the visualization.
     """
 
-    workspace = fabric.resolve_workspace_name(workspace)
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
+    (dataset_name, dataset_id) = resolve_dataset_name_and_id(dataset, workspace_id)
 
     if isinstance(tables, str):
         tables = [tables]
@@ -118,11 +121,11 @@ def refresh_semantic_model(
         def extract_failure_error():
             error_messages = []
             combined_messages = ""
-            final_message = f"{icons.red_dot} The refresh of the '{dataset}' semantic model within the '{workspace}' workspace has failed."
+            final_message = f"{icons.red_dot} The refresh of the '{dataset_name}' semantic model within the '{workspace_name}' workspace has failed."
             for _, r in fabric.get_refresh_execution_details(
                 refresh_request_id=request_id,
-                dataset=dataset,
-                workspace=workspace,
+                dataset=dataset_id,
+                workspace=workspace_id,
             ).messages.iterrows():
                 error_messages.append(f"{r['Type']}: {r['Message']}")
 
@@ -135,8 +138,8 @@ def refresh_semantic_model(
         # Function to perform dataset refresh
         def refresh_dataset():
             return fabric.refresh_dataset(
-                dataset=dataset,
-                workspace=workspace,
+                dataset=dataset_id,
+                workspace=workspace_id,
                 refresh_type=refresh_type,
                 retry_count=retry_count,
                 apply_refresh_policy=apply_refresh_policy,
@@ -147,7 +150,9 @@ def refresh_semantic_model(
 
         def check_refresh_status(request_id):
             request_details = fabric.get_refresh_execution_details(
-                dataset=dataset, refresh_request_id=request_id, workspace=workspace
+                dataset=dataset_id,
+                refresh_request_id=request_id,
+                workspace=workspace_id,
             )
             return request_details.status
 
@@ -169,7 +174,8 @@ def refresh_semantic_model(
                     right_on="PartitionID",
                     how="left",
                 )
-                _process_and_display_chart(df, title=title, widget=widget)
+                if not df.empty:
+                    _process_and_display_chart(df, title=title, widget=widget)
                 if stop:
                     df.drop(["Object Name", "PartitionID"], axis=1, inplace=True)
                     df.rename(columns={"TableName": "Table Name"}, inplace=True)
@@ -180,7 +186,7 @@ def refresh_semantic_model(
         if not visualize:
             request_id = refresh_dataset()
         print(
-            f"{icons.in_progress} Refresh of the '{dataset}' semantic model within the '{workspace}' workspace is in progress..."
+            f"{icons.in_progress} Refresh of the '{dataset_name}' semantic model within the '{workspace_name}' workspace is in progress..."
         )
 
         # Monitor refresh progress and handle tracing if visualize is enabled
@@ -189,7 +195,7 @@ def refresh_semantic_model(
             widget = widgets.Output()
 
             with fabric.create_trace_connection(
-                dataset=dataset, workspace=workspace
+                dataset=dataset_id, workspace=workspace_id
             ) as trace_connection:
                 with trace_connection.create_trace(icons.refresh_event_schema) as trace:
                     trace.start()
@@ -204,7 +210,7 @@ def refresh_semantic_model(
                             raise ValueError(extract_failure_error())
                         elif status == "Cancelled":
                             print(
-                                f"{icons.yellow_dot} The refresh of the '{dataset}' semantic model within the '{workspace}' workspace has been cancelled."
+                                f"{icons.yellow_dot} The refresh of the '{dataset_name}' semantic model within the '{workspace_name}' workspace has been cancelled."
                             )
                             return
 
@@ -231,7 +237,7 @@ def refresh_semantic_model(
                     )
 
                     print(
-                        f"{icons.green_dot} Refresh '{refresh_type}' of the '{dataset}' semantic model within the '{workspace}' workspace is complete."
+                        f"{icons.green_dot} Refresh '{refresh_type}' of the '{dataset_name}' semantic model within the '{workspace_name}' workspace is complete."
                     )
                     return final_df
 
@@ -245,14 +251,14 @@ def refresh_semantic_model(
                     raise ValueError(extract_failure_error())
                 elif status == "Cancelled":
                     print(
-                        f"{icons.yellow_dot} The refresh of the '{dataset}' semantic model within the '{workspace}' workspace has been cancelled."
+                        f"{icons.yellow_dot} The refresh of the '{dataset_name}' semantic model within the '{workspace_name}' workspace has been cancelled."
                     )
                     return
 
                 time.sleep(3)
 
             print(
-                f"{icons.green_dot} Refresh '{refresh_type}' of the '{dataset}' semantic model within the '{workspace}' workspace is complete."
+                f"{icons.green_dot} Refresh '{refresh_type}' of the '{dataset_name}' semantic model within the '{workspace_name}' workspace is complete."
             )
 
     final_output = refresh_and_trace_dataset(
@@ -272,54 +278,54 @@ def refresh_semantic_model(
 
 @log
 def cancel_dataset_refresh(
-    dataset: str, request_id: Optional[str] = None, workspace: Optional[str] = None
+    dataset: str | UUID,
+    request_id: Optional[str] = None,
+    workspace: Optional[str | UUID] = None,
 ):
     """
     Cancels the refresh of a semantic model which was executed via the `Enhanced Refresh API <https://learn.microsoft.com/power-bi/connect-data/asynchronous-refresh>`_
 
     Parameters
     ----------
-    dataset : str
-        Name of the semantic model.
+    dataset : str | uuid.UUID
+        Name or ID of the semantic model.
     request_id : str, default=None
         The request id of a semantic model refresh.
         Defaults to finding the latest active refresh of the semantic model.
-    workspace : str, default=None
-        The Fabric workspace name.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
     """
 
-    (workspace, workspace_id) = resolve_workspace_name_and_id(workspace)
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
+    (dataset_name, dataset_id) = resolve_dataset_name_and_id(dataset, workspace_id)
 
-    rr = fabric.list_refresh_requests(dataset=dataset, workspace=workspace)
+    rr = fabric.list_refresh_requests(dataset=dataset_id, workspace=workspace_id)
     rr_filt = rr[rr["Status"] == "Unknown"]
 
     if request_id is None:
         if len(rr_filt) == 0:
             raise ValueError(
-                f"{icons.red_dot} There are no active Enhanced API refreshes of the '{dataset}' semantic model within the '{workspace}' workspace."
+                f"{icons.red_dot} There are no active Enhanced API refreshes of the '{dataset_name}' semantic model within the '{workspace_name}' workspace."
             )
 
         request_id = rr_filt["Request Id"].iloc[0]
 
-    dataset_id = resolve_dataset_id(dataset=dataset, workspace=workspace)
-
-    client = fabric.PowerBIRestClient()
-
-    response = client.delete(
-        f"/v1.0/myorg/groups/{workspace_id}/datasets/{dataset_id}/refreshes/{request_id}"
+    _base_api(
+        request=f"/v1.0/myorg/groups/{workspace_id}/datasets/{dataset_id}/refreshes/{request_id}",
+        method="delete",
     )
-
-    if response.status_code != 200:
-        raise FabricHTTPException(response)
     print(
-        f"{icons.green_dot} The '{request_id}' refresh request for the '{dataset}' semantic model within the '{workspace}' workspace has been cancelled."
+        f"{icons.green_dot} The '{request_id}' refresh request for the '{dataset_name}' semantic model within the '{workspace_name}' workspace has been cancelled."
     )
 
 
+@log
 def get_semantic_model_refresh_history(
-    dataset: str, request_id: Optional[str] = None, workspace: Optional[str] = None
+    dataset: str | UUID,
+    request_id: Optional[str] = None,
+    workspace: Optional[str | UUID] = None,
 ) -> pd.DataFrame:
     """
     Obtains the semantic model refresh history (refreshes executed via the Enhanced Refresh API).
@@ -328,13 +334,13 @@ def get_semantic_model_refresh_history(
 
     Parameters
     ----------
-    dataset : str
-        Name of the semantic model.
+    dataset : str | uuid.UUID
+        Name or ID of the semantic model.
     request_id : str, default=None
         The request id of a semantic model refresh.
         Defaults to None which resolves to showing all refresh requests for the given semantic model.
-    workspace : str, default=None
-        The Fabric workspace name.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
 
@@ -344,8 +350,8 @@ def get_semantic_model_refresh_history(
         A pandas dataframe showing the semantic model refresh history.
     """
 
-    workspace_name = fabric.resolve_workspace_name(workspace)
-    workspace_id = fabric.resolve_workspace_id(workspace_name)
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
+    (dataset_name, dataset_id) = resolve_dataset_name_and_id(dataset, workspace_id)
     df = pd.DataFrame(
         columns=[
             "Request Id",
@@ -357,12 +363,8 @@ def get_semantic_model_refresh_history(
         ]
     )
 
-    dataset_id = fabric.resolve_item_id(
-        item_name=dataset, workspace=workspace_id, type="SemanticModel"
-    )
-    client = fabric.PowerBIRestClient()
-    response = client.get(
-        f"/v1.0/myorg/groups/{workspace_id}/datasets/{dataset_id}/refreshes"
+    response = _base_api(
+        request=f"/v1.0/myorg/groups/{workspace_id}/datasets/{dataset_id}/refreshes"
     )
     data = []
 
@@ -424,8 +426,10 @@ def get_semantic_model_refresh_history(
     # df[date_cols] = df[date_cols].apply(pd.to_datetime)
 
     if "Attempt Id" in df.columns:
-        df["Attempt Id"] = df["Attempt Id"].astype(int)
-        # date_cols = ["Attempt Start Time", "Attempt End Time"]
-        # df[date_cols] = df[date_cols].apply(pd.to_datetime)
+        column_map = {
+            "Attempt Id": "int",
+        }
+
+        _update_dataframe_datatypes(dataframe=df, column_map=column_map)
 
     return df

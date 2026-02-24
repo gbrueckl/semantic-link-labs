@@ -1,40 +1,96 @@
-import sempy.fabric as fabric
-from typing import Optional, List
+from typing import Literal, Optional, List
 import sempy_labs._icons as icons
-from sempy_labs._helper_functions import lro
-from sempy.fabric.exceptions import FabricHTTPException
 import pandas as pd
 from uuid import UUID
+from sempy_labs.admin._basic_functions import list_workspaces
+from sempy_labs._helper_functions import (
+    _base_api,
+    _create_dataframe,
+    _is_valid_uuid,
+)
+from sempy._utils._log import log
 
 
-def resolve_domain_id(domain_name: str) -> UUID:
+@log
+def resolve_domain_id(domain: Optional[str | UUID] = None, **kwargs) -> UUID:
     """
     Obtains the domain Id for a given domain name.
 
     Parameters
     ----------
-    domain_name : str
-        The domain name
+    domain_name : str | uuid.UUID
+        The domain name or ID
 
     Returns
     -------
-    UUID
+    uuid.UUID
         The domain Id.
     """
 
+    if "domain_name" in kwargs:
+        domain = kwargs["domain_name"]
+        print(
+            f"{icons.warning} The 'domain_name' parameter is deprecated. Please use 'domain' instead."
+        )
+
+    if domain is None:
+        raise ValueError(f"{icons.red_dot} Please provide a domain.")
+
+    if _is_valid_uuid(domain):
+        return domain
+
     dfL = list_domains()
-    dfL_filt = dfL[dfL["Domain Name"] == domain_name]
-    if len(dfL_filt) == 0:
-        raise ValueError(f"{icons.red_dot} '{domain_name}' is not a valid domain name.")
+    dfL_filt = dfL[dfL["Domain Name"] == domain]
+    if dfL_filt.empty:
+        raise ValueError(f"{icons.red_dot} '{domain}' is not a valid domain name.")
 
     return dfL_filt["Domain ID"].iloc[0]
 
 
+@log
+def resolve_domain_name(domain: Optional[str | UUID], **kwargs) -> UUID:
+    """
+    Obtains the domain name for a given domain ID.
+
+    Parameters
+    ----------
+    domain : str | uuid.UUID
+        The domain name or ID
+
+    Returns
+    -------
+    str
+        The domain Name.
+    """
+
+    if "domain_name" in kwargs:
+        domain = kwargs["domain_name"]
+        print(
+            f"{icons.warning} The 'domain_name' parameter is deprecated. Please use 'domain' instead."
+        )
+
+    if domain is None:
+        raise ValueError(f"{icons.red_dot} Please provide a domain.")
+
+    if not _is_valid_uuid(domain):
+        return domain
+
+    dfL = list_domains()
+    dfL_filt = dfL[dfL["Domain ID"] == domain]
+    if dfL_filt.empty:
+        raise ValueError(f"{icons.red_dot} '{domain}' is not a valid domain name.")
+
+    return dfL_filt["Domain Name"].iloc[0]
+
+
+@log
 def list_domains(non_empty_only: bool = False) -> pd.DataFrame:
     """
     Shows a list of domains.
 
     This is a wrapper function for the following API: `Domains - List Domains <https://learn.microsoft.com/rest/api/fabric/admin/domains/list-domains>`_.
+
+    Service Principal Authentication is supported (see `here <https://github.com/microsoft/semantic-link-labs/blob/main/notebooks/Service%20Principal.ipynb>`_ for examples).
 
     Parameters
     ----------
@@ -48,48 +104,52 @@ def list_domains(non_empty_only: bool = False) -> pd.DataFrame:
         A pandas dataframe showing a list of the domains.
     """
 
-    df = pd.DataFrame(
-        columns=[
-            "Domain ID",
-            "Domain Name",
-            "Description",
-            "Parent Domain ID",
-            "Contributors Scope",
-        ]
-    )
+    columns = {
+        "Domain ID": "string",
+        "Domain Name": "string",
+        "Description": "string",
+        "Parent Domain ID": "string",
+        "Contributors Scope": "string",
+    }
+    df = _create_dataframe(columns=columns)
 
-    client = fabric.FabricRestClient()
     url = "/v1/admin/domains"
     if non_empty_only:
         url = f"{url}?nonEmptyOnly=True"
-    response = client.get(url)
 
-    if response.status_code != 200:
-        raise FabricHTTPException(response)
+    response = _base_api(request=url, client="fabric_sp")
 
+    rows = []
     for v in response.json().get("domains", []):
-        new_data = {
-            "Domain ID": v.get("id"),
-            "Domain Name": v.get("displayName"),
-            "Description": v.get("description"),
-            "Parent Domain ID": v.get("parentDomainId"),
-            "Contributors Scope": v.get("contributorsScope"),
-        }
-        df = pd.concat([df, pd.DataFrame(new_data, index=[0])], ignore_index=True)
+        rows.append(
+            {
+                "Domain ID": v.get("id"),
+                "Domain Name": v.get("displayName"),
+                "Description": v.get("description"),
+                "Parent Domain ID": v.get("parentDomainId"),
+                "Contributors Scope": v.get("contributorsScope"),
+            }
+        )
+
+    if rows:
+        df = pd.DataFrame(rows, columns=list(columns.keys()))
 
     return df
 
 
-def list_domain_workspaces(domain_name: str) -> pd.DataFrame:
+@log
+def list_domain_workspaces(domain: Optional[str] = None, **kwargs) -> pd.DataFrame:
     """
     Shows a list of workspaces within the domain.
 
     This is a wrapper function for the following API: `Domains - List Domain Workspaces <https://learn.microsoft.com/rest/api/fabric/admin/domains/list-domain-workspaces>`_.
 
+    Service Principal Authentication is supported (see `here <https://github.com/microsoft/semantic-link-labs/blob/main/notebooks/Service%20Principal.ipynb>`_ for examples).
+
     Parameters
     ----------
-    domain_name : str
-        The domain name.
+    domain : str | uuid.UUID
+        The domain name or ID.
 
     Returns
     -------
@@ -97,108 +157,157 @@ def list_domain_workspaces(domain_name: str) -> pd.DataFrame:
         A pandas dataframe showing a list of workspaces within the domain.
     """
 
-    domain_id = resolve_domain_id(domain_name)
+    if "domain_name" in kwargs:
+        domain = kwargs["domain_name"]
+        print(
+            f"{icons.warning} The 'domain_name' parameter is deprecated. Please use 'domain' instead."
+        )
 
-    df = pd.DataFrame(columns=["Workspace ID", "Workspace Name"])
+    if domain is None:
+        raise ValueError(f"{icons.red_dot} Please provide a domain.")
 
-    client = fabric.FabricRestClient()
-    response = client.get(f"/v1/admin/domains/{domain_id}/workspaces")
+    domain_id = resolve_domain_id(domain)
 
-    if response.status_code != 200:
-        raise FabricHTTPException(response)
+    columns = {
+        "Workspace ID": "string",
+        "Workspace Name": "string",
+    }
+    df = _create_dataframe(columns=columns)
 
+    response = _base_api(
+        request=f"/v1/admin/domains/{domain_id}/workspaces", client="fabric_sp"
+    )
+
+    rows = []
     for v in response.json().get("value", []):
-        new_data = {
-            "Workspace ID": v.get("id"),
-            "Workspace Name": v.get("displayName"),
-        }
-        df = pd.concat([df, pd.DataFrame(new_data, index=[0])], ignore_index=True)
+        rows.append(
+            {
+                "Workspace ID": v.get("id"),
+                "Workspace Name": v.get("displayName"),
+            }
+        )
+
+    if rows:
+        df = pd.DataFrame(rows, columns=list(columns.keys()))
 
     return df
 
 
+@log
 def create_domain(
     domain_name: str,
     description: Optional[str] = None,
-    parent_domain_name: Optional[str] = None,
+    parent_domain: Optional[str | UUID] = None,
+    **kwargs,
 ):
     """
     Creates a new domain.
 
     This is a wrapper function for the following API: `Domains - Create Domain <https://learn.microsoft.com/rest/api/fabric/admin/domains/create-domain>`_.
 
+    Service Principal Authentication is supported (see `here <https://github.com/microsoft/semantic-link-labs/blob/main/notebooks/Service%20Principal.ipynb>`_ for examples).
+
     Parameters
     ----------
     domain_name : str
         The domain name.
     description : str, default=None
         The domain description.
-    parent_domain_name : str, default=None
-        The parent domain name.
+    parent_domain : str | uuid.UUID, default=None
+        The parent domain name or ID.
     """
 
-    if parent_domain_name is not None:
-        parent_domain_id = resolve_domain_id(parent_domain_name)
+    if "parent_domain_name" in kwargs:
+        parent_domain = kwargs["parent_domain_name"]
+        print(
+            f"{icons.warning} The 'parent_domain_name' parameter is deprecated. Please use 'parent_domain' instead."
+        )
+
+    if parent_domain is not None:
+        parent_domain_id = resolve_domain_id(domain=parent_domain)
 
     payload = {}
     payload["displayName"] = domain_name
     if description is not None:
         payload["description"] = description
-    if parent_domain_name is not None:
+    if parent_domain is not None:
         payload["parentDomainId"] = parent_domain_id
 
-    client = fabric.FabricRestClient()
-    response = client.post("/v1/admin/domains", json=payload)
-
-    if response.status_code != 201:
-        raise FabricHTTPException(response)
+    _base_api(
+        request="/v1/admin/domains",
+        method="post",
+        payload=payload,
+        status_codes=201,
+        client="fabric_sp",
+    )
 
     print(f"{icons.green_dot} The '{domain_name}' domain has been created.")
 
 
-def delete_domain(domain_name: str):
+@log
+def delete_domain(domain: Optional[str | UUID], **kwargs):
     """
     Deletes a domain.
 
     This is a wrapper function for the following API: `Domains - Delete Domain <https://learn.microsoft.com/rest/api/fabric/admin/domains/delete-domain>`_.
 
+    Service Principal Authentication is supported (see `here <https://github.com/microsoft/semantic-link-labs/blob/main/notebooks/Service%20Principal.ipynb>`_ for examples).
+
     Parameters
     ----------
-    domain_name : str
-        The domain name.
+    domain : str | uuid.UUID
+        The domain name or ID.
     """
 
-    domain_id = resolve_domain_id(domain_name)
+    if "domain_name" in kwargs:
+        domain = kwargs["domain_name"]
+        print(
+            f"{icons.warning} The 'domain_name' parameter is deprecated. Please use 'domain' instead."
+        )
 
-    client = fabric.FabricRestClient()
-    response = client.delete(f"/v1/admin/domains/{domain_id}")
+    if domain is None:
+        raise ValueError(f"{icons.red_dot} Please provide a domain.")
 
-    if response.status_code != 200:
-        raise FabricHTTPException(response)
+    domain_id = resolve_domain_id(domain)
+    _base_api(
+        request=f"/v1/admin/domains/{domain_id}", method="delete", client="fabric_sp"
+    )
 
-    print(f"{icons.green_dot} The '{domain_name}' domain has been deleted.")
+    print(f"{icons.green_dot} The '{domain}' domain has been deleted.")
 
 
+@log
 def update_domain(
-    domain_name: str,
+    domain: Optional[str | UUID] = None,
     description: Optional[str] = None,
     contributors_scope: Optional[str] = None,
+    **kwargs,
 ):
     """
     Updates a domain's properties.
 
     This is a wrapper function for the following API: `Domains - Update Domain <https://learn.microsoft.com/rest/api/fabric/admin/domains/update-domain>`_.
 
+    Service Principal Authentication is supported (see `here <https://github.com/microsoft/semantic-link-labs/blob/main/notebooks/Service%20Principal.ipynb>`_ for examples).
+
     Parameters
     ----------
-    domain_name : str
-        The domain name.
+    domain : str | uuid.UUID
+        The domain name or ID.
     description : str, default=None
         The domain description.
     contributors_scope : str, default=None
         The domain `contributor scope <https://learn.microsoft.com/rest/api/fabric/admin/domains/update-domain?tabs=HTTP#contributorsscopetype>`_.
     """
 
+    if "domain_name" in kwargs:
+        domain = kwargs["domain_name"]
+        print(
+            f"{icons.warning} The 'domain_name' parameter is deprecated. Please use 'domain' instead."
+        )
+
+    if domain is None:
+        raise ValueError(f"{icons.red_dot} Please provide a domain.")
     contributors_scopes = ["AdminsOnly", "AllTenant", "SpecificUsersAndGroups"]
 
     if contributors_scope not in contributors_scopes:
@@ -206,7 +315,8 @@ def update_domain(
             f"{icons.red_dot} Invalid contributors scope. Valid options: {contributors_scopes}."
         )
 
-    domain_id = resolve_domain_id(domain_name)
+    domain_id = resolve_domain_id(domain)
+    domain_name = resolve_domain_name(domain)
 
     payload = {}
     payload["displayName"] = domain_name
@@ -216,34 +326,48 @@ def update_domain(
     if contributors_scope is not None:
         payload["contributorsScope"] = contributors_scope
 
-    client = fabric.FabricRestClient()
-    response = client.patch(f"/v1/admin/domains/{domain_id}", json=payload)
-
-    if response != 200:
-        raise FabricHTTPException(response)
+    _base_api(
+        request=f"/v1/admin/domains/{domain_id}",
+        method="patch",
+        payload=payload,
+        client="fabric_sp",
+    )
 
     print(f"{icons.green_dot} The '{domain_name}' domain has been updated.")
 
 
+@log
 def assign_domain_workspaces_by_capacities(
-    domain_name: str, capacity_names: str | List[str]
+    domain: str | UUID,
+    capacity_names: str | List[str],
+    **kwargs,
 ):
     """
     Assigns all workspaces that reside on the specified capacities to the specified domain.
 
     This is a wrapper function for the following API: `Domains - Assign Domain Workspaces By Capacities <https://learn.microsoft.com/rest/api/fabric/admin/domains/assign-domain-workspaces-by-capacities>`_.
 
+    Service Principal Authentication is supported (see `here <https://github.com/microsoft/semantic-link-labs/blob/main/notebooks/Service%20Principal.ipynb>`_ for examples).
+
     Parameters
     ----------
-    domain_name : str
-        The domain name.
+    domain : str | uuid.UUID
+        The domain name or ID.
     capacity_names : str | List[str]
         The capacity names.
     """
 
-    from sempy_labs.admin import list_capacities
+    from sempy_labs.admin._capacities import list_capacities
 
-    domain_id = resolve_domain_id(domain_name)
+    if "domain_name" in kwargs:
+        domain = kwargs["domain_name"]
+        print(
+            f"{icons.warning} The 'domain_name' parameter is deprecated. Please use 'domain' instead."
+        )
+
+    if domain is None:
+        raise ValueError(f"{icons.red_dot} Please provide a domain.")
+    domain_id = resolve_domain_id(domain)
 
     if isinstance(capacity_names, str):
         capacity_names = [capacity_names]
@@ -270,116 +394,144 @@ def assign_domain_workspaces_by_capacities(
 
     payload = {"capacitiesIds": capacity_list}
 
-    client = fabric.FabricRestClient()
-    response = client.post(
-        f"/v1/admin/domains/{domain_id}/assignWorkspacesByCapacities",
-        json=payload,
+    _base_api(
+        request=f"/v1/admin/domains/{domain_id}/assignWorkspacesByCapacities",
+        method="post",
+        payload=payload,
+        lro_return_status_code=True,
+        status_codes=202,
+        client="fabric_sp",
     )
-
-    lro(client, response)
 
     print(
-        f"{icons.green_dot} The workspaces in the {capacity_names} capacities have been assigned to the '{domain_name}' domain."
+        f"{icons.green_dot} The workspaces in the {capacity_names} capacities have been assigned to the '{domain}' domain."
     )
 
 
-def assign_domain_workspaces(domain_name: str, workspace_names: str | List[str]):
+@log
+def assign_domain_workspaces(
+    domain: str | UUID, workspace: str | UUID | List[str | UUID], **kwargs
+):
     """
     Assigns workspaces to the specified domain by workspace.
 
     This is a wrapper function for the following API: `Domains - Assign Domain Workspaces By Ids <https://learn.microsoft.com/rest/api/fabric/admin/domains/assign-domain-workspaces-by-ids>`_.
 
+    Service Principal Authentication is supported (see `here <https://github.com/microsoft/semantic-link-labs/blob/main/notebooks/Service%20Principal.ipynb>`_ for examples).
+
     Parameters
     ----------
-    domain_name : str
-        The domain name.
-    workspace_names : str | List[str]
-        The Fabric workspace(s).
+    domain : str | uuid.UUID
+        The domain name or ID.
+    workspace : str | uuid.UUID | List[str | uuid.UUID]
+        The Fabric workspace name or IDs.
     """
 
-    domain_id = resolve_domain_id(domain_name=domain_name)
+    domain_id = resolve_domain_id(domain)
 
-    if isinstance(workspace_names, str):
-        workspace_names = [workspace_names]
+    if "workspace_names" in kwargs:
+        workspace = kwargs["workspace_names"]
+        print(
+            f"{icons.warning} The 'workspace_names' parameter is deprecated. Please use 'workspace' instead."
+        )
 
-    dfW = fabric.list_workspaces()
+    if isinstance(workspace, str):
+        workspace = [workspace]
+    workspace_list = []
+
+    for w in workspace:
+        if _is_valid_uuid(w):
+            workspace_list.append(w)
+        else:
+            dfW = list_workspaces(workspace=w)
+            if not dfW.empty:
+                workspace_list.append(dfW["Id"].iloc[0])
 
     # Check for invalid capacities
-    invalid_workspaces = [
-        name for name in workspace_names if name not in dfW["Name"].values
-    ]
+    # invalid_workspaces = [
+    #    name for name in workspace_names if name not in dfW["Name"].values
+    # ]
 
-    if len(invalid_workspaces) == 1:
-        raise ValueError(
-            f"{icons.red_dot} The {invalid_workspaces} workspace is not valid."
-        )
-    elif len(invalid_workspaces) > 1:
-        raise ValueError(
-            f"{icons.red_dot} The {invalid_workspaces} workspaces are not valid."
-        )
+    # if len(invalid_workspaces) == 1:
+    #    raise ValueError(
+    #        f"{icons.red_dot} The {invalid_workspaces} workspace is not valid."
+    #    )
+    # elif len(invalid_workspaces) > 1:
+    #    raise ValueError(
+    #        f"{icons.red_dot} The {invalid_workspaces} workspaces are not valid."
+    #    )
 
-    dfW_filt = dfW[dfW["Name"].isin(workspace_names)]
-    workspace_list = list(dfW_filt["Id"])
+    # dfW_filt = dfW[dfW["Name"].isin(workspace_names)]
+    # workspace_list = list(dfW_filt["Id"])
 
     payload = {"workspacesIds": workspace_list}
 
-    client = fabric.FabricRestClient()
-    response = client.post(
-        f"/v1/admin/domains/{domain_id}/assignWorkspaces",
-        json=payload,
+    _base_api(
+        request=f"/v1/admin/domains/{domain_id}/assignWorkspaces",
+        method="post",
+        payload=payload,
+        client="fabric_sp",
     )
-
-    lro(client, response)
 
     print(
-        f"{icons.green_dot} The {workspace_names} workspaces have been assigned to the '{domain_name}' domain."
+        f"{icons.green_dot} The {workspace} workspaces have been assigned to the '{domain}' domain."
     )
 
 
-def unassign_all_domain_workspaces(domain_name: str):
+@log
+def unassign_all_domain_workspaces(domain: str | UUID):
     """
     Unassigns all workspaces from the specified domain.
 
     This is a wrapper function for the following API: `Domains - Unassign All Domain Workspaces <https://learn.microsoft.com/rest/api/fabric/admin/domains/unassign-all-domain-workspaces>`_.
 
+    Service Principal Authentication is supported (see `here <https://github.com/microsoft/semantic-link-labs/blob/main/notebooks/Service%20Principal.ipynb>`_ for examples).
+
     Parameters
     ----------
-    domain_name : str
-        The domain name.
+    domain : str | uuid.UUID
+        The domain name or ID.
     """
 
-    domain_id = resolve_domain_id(domain_name=domain_name)
+    domain_id = resolve_domain_id(domain)
 
-    client = fabric.FabricRestClient()
-    response = client.post(f"/v1/admin/domains/{domain_id}/unassignAllWorkspaces")
+    _base_api(
+        request=f"/v1/admin/domains/{domain_id}/unassignAllWorkspaces",
+        method="post",
+        client="fabric_sp",
+    )
 
-    if response.status_code != 200:
-        raise FabricHTTPException(response)
     print(
-        f"{icons.green_dot} All workspaces assigned to the '{domain_name}' domain have been unassigned."
+        f"{icons.green_dot} All workspaces assigned to the '{domain}' domain have been unassigned."
     )
 
 
-def unassign_domain_workspaces(domain_name: str, workspace_names: str | List[str]):
+@log
+def unassign_domain_workspaces(
+    domain: str | UUID,
+    workspace_names: str | List[str],
+):
     """
     Unassigns workspaces from the specified domain by workspace.
 
     This is a wrapper function for the following API: `Domains - Unassign Domain Workspaces By Ids <https://learn.microsoft.com/rest/api/fabric/admin/domains/unassign-domain-workspaces-by-ids>`_.
 
+    Service Principal Authentication is supported (see `here <https://github.com/microsoft/semantic-link-labs/blob/main/notebooks/Service%20Principal.ipynb>`_ for examples).
+
     Parameters
     ----------
-    domain_name : str
-        The domain name.
+    domain : str | uuid.UUID
+        The domain name or ID.
     workspace_names : str | List[str]
         The Fabric workspace(s).
     """
 
-    domain_id = resolve_domain_id(domain_name=domain_name)
+    domain_id = resolve_domain_id(domain)
 
     if isinstance(workspace_names, str):
         workspace_names = [workspace_names]
 
-    dfW = fabric.list_workspaces()
+    dfW = list_workspaces()
 
     # Check for invalid capacities
     invalid_workspaces = [
@@ -399,13 +551,52 @@ def unassign_domain_workspaces(domain_name: str, workspace_names: str | List[str
     workspace_list = list(dfW_filt["Id"])
 
     payload = {"workspacesIds": workspace_list}
-    client = fabric.FabricRestClient()
-    response = client.post(
-        f"/v1/admin/domains/{domain_id}/unassignWorkspaces", json=payload
+
+    _base_api(
+        request=f"/v1/admin/domains/{domain_id}/unassignWorkspaces",
+        method="post",
+        payload=payload,
+        client="fabric_sp",
     )
 
-    if response.status_code != 200:
-        raise FabricHTTPException(response)
     print(
-        f"{icons.green_dot} The {workspace_names} workspaces assigned to the '{domain_name}' domain have been unassigned."
+        f"{icons.green_dot} The {workspace_names} workspaces assigned to the '{domain}' domain have been unassigned."
+    )
+
+
+@log
+def sync_role_assignments_to_subdomains(
+    domain: str | UUID, role: Literal["Admin", "Contributor"]
+):
+    """
+    Sync the role assignments from the specified domain to its subdomains.
+
+    This is a wrapper function for the following API: `Domains - Sync Role Assignments To Subdomains <https://learn.microsoft.com/rest/api/fabric/admin/domains/sync-role-assignments-to-subdomains>`_.
+
+    Parameters
+    ----------
+    domain : str | uuid.UUID
+        The domain name or ID.
+    role : typing.Literal["Admin", "Contributor"]
+        The role to sync. Valid options: 'Admin', 'Contributor'.
+    """
+
+    role = role.capitalize()
+    valid_roles = ["Admin", "Contributor"]
+    if role not in valid_roles:
+        raise ValueError(f"{icons.red_dot} Invalid role. Valid options: {valid_roles}.")
+
+    domain_id = resolve_domain_id(domain)
+
+    payload = {"role": role}
+
+    _base_api(
+        request=f"/v1/admin/domains/{domain_id}/roleAssignments/syncToSubdomains",
+        method="post",
+        client="fabric_sp",
+        payload=payload,
+    )
+
+    print(
+        f"{icons.green_dot} The '{role}' role assignments for the '{domain}' domain have been synced to its subdomains."
     )

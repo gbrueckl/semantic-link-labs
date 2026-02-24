@@ -1,31 +1,36 @@
 import sempy.fabric as fabric
 import pandas as pd
 import re
-from sempy_labs._helper_functions import retry
-from pyspark.sql import SparkSession
-from sempy_labs.tom import connect_semantic_model
+from ..tom import connect_semantic_model
 from typing import Optional
 from sempy._utils._log import log
 import sempy_labs._icons as icons
+from uuid import UUID
+from .._helper_functions import (
+    resolve_workspace_name_and_id,
+    resolve_dataset_name_and_id,
+    save_as_delta_table,
+    retry,
+)
 
 
 @log
-def refresh_calc_tables(dataset: str, workspace: Optional[str] = None):
+def refresh_calc_tables(dataset: str | UUID, workspace: Optional[str | UUID] = None):
     """
     Recreates the delta tables in the lakehouse based on the DAX expressions stored as model annotations in the Direct Lake semantic model.
 
     Parameters
     ----------
-    dataset : str
-        Name of the semantic model.
-    workspace : str, default=None
-        The Fabric workspace name.
+    dataset : str | UUID
+        Name or ID of the semantic model.
+    workspace : str | UUID, default=None
+        The Fabric workspace name or ID.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
     """
 
-    spark = SparkSession.builder.getOrCreate()
-    workspace = fabric.resolve_workspace_name(workspace)
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
+    (dataset_name, dataset_id) = resolve_dataset_name_and_id(dataset, workspace_id)
     icons.sll_tags.append("DirectLakeMigration")
 
     @retry(
@@ -34,7 +39,7 @@ def refresh_calc_tables(dataset: str, workspace: Optional[str] = None):
     )
     def dyn_connect():
         with connect_semantic_model(
-            dataset=dataset, readonly=True, workspace=workspace
+            dataset=dataset_id, readonly=True, workspace=workspace_id
         ) as tom:
 
             tom.model
@@ -42,7 +47,7 @@ def refresh_calc_tables(dataset: str, workspace: Optional[str] = None):
     dyn_connect()
 
     with connect_semantic_model(
-        dataset=dataset, readonly=True, workspace=workspace
+        dataset=dataset_id, readonly=True, workspace=workspace_id
     ) as tom:
         for a in tom.model.Annotations:
             if any(a.Name == t.Name for t in tom.model.Tables):
@@ -56,9 +61,9 @@ def refresh_calc_tables(dataset: str, workspace: Optional[str] = None):
 
                 try:
                     df = fabric.evaluate_dax(
-                        dataset=dataset,
+                        dataset=dataset_id,
                         dax_string=daxquery,
-                        workspace=workspace,
+                        workspace=workspace_id,
                     )
 
                     # Update column names for non-field parameters
@@ -111,10 +116,12 @@ def refresh_calc_tables(dataset: str, workspace: Optional[str] = None):
                         f"{icons.in_progress} Refresh of the '{delta_table_name}' table within the lakehouse is in progress..."
                     )
 
-                    spark_df = spark.createDataFrame(df)
-                    spark_df.write.mode("overwrite").format("delta").saveAsTable(
-                        delta_table_name
+                    save_as_delta_table(
+                        dataframe=df,
+                        table_name=delta_table_name,
+                        write_mode="overwrite",
                     )
+
                     print(
                         f"{icons.green_dot} Calculated table '{tName}' has been refreshed as the '{delta_table_name.lower()}' table in the lakehouse."
                     )

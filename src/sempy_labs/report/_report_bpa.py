@@ -1,34 +1,35 @@
-import sempy.fabric as fabric
 from typing import Optional
 import pandas as pd
 import datetime
 from sempy._utils._log import log
-from sempy_labs.report import ReportWrapper, report_bpa_rules
+from sempy_labs.report._reportwrapper import connect_report
+from sempy_labs.report._report_bpa_rules import report_bpa_rules
 from sempy_labs._helper_functions import (
     format_dax_object_name,
     save_as_delta_table,
-    resolve_report_id,
-    resolve_lakehouse_name,
+    resolve_item_name_and_id,
     resolve_workspace_capacity,
-    _get_max_run_id,
+    _get_column_aggregate,
+    resolve_workspace_name_and_id,
 )
 from sempy_labs.lakehouse import get_lakehouse_tables, lakehouse_attached
 import sempy_labs._icons as icons
 from IPython.display import display, HTML
-import sempy_labs.report._report_helper as helper
+from uuid import UUID
 
 
 @log
 def run_report_bpa(
     report: str,
     rules: Optional[pd.DataFrame] = None,
-    workspace: Optional[str] = None,
+    workspace: Optional[str | UUID] = None,
     # language: Optional[str] = None,
     export: bool = False,
     return_dataframe: bool = False,
 ):
     """
     Displays an HTML visualization of the results of the Best Practice Analyzer scan for a report.
+    Note: As with all functions which rely on the ReportWrapper, this function requires the report to be in the 'PBIR' format.
 
     Parameters
     ----------
@@ -36,8 +37,8 @@ def run_report_bpa(
         Name of the report.
     rules : pandas.DataFrame, default=None
         A pandas dataframe containing rules to be evaluated.
-    workspace : str, default=None
-        The Fabric workspace name.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
     export : bool, default=False
@@ -51,124 +52,114 @@ def run_report_bpa(
         A pandas dataframe in HTML format showing report objects which violated the best practice analyzer rules.
     """
 
-    rpt = ReportWrapper(report=report, workspace=workspace)
+    with connect_report(
+        report=report, workspace=workspace, readonly=True, show_diffs=False
+    ) as rpt:
 
-    dfCV = rpt.list_custom_visuals()
-    dfP = rpt.list_pages()
-    dfRF = rpt.list_report_filters()
-    dfRF["Filter Object"] = format_dax_object_name(
-        dfRF["Table Name"], dfRF["Object Name"]
-    )
-    dfPF = rpt.list_page_filters()
-    # Convert back to dataframe
-    # if isinstance(dfPF, pd.io.formats.style.Styler):
-    #    dfPF = dfPF.data
-    # if isinstance(dfP, pd.io.formats.style.Styler):
-    #    dfP = dfP.data
+        dfCV = rpt.list_custom_visuals()
+        dfP = rpt.list_pages()
+        dfRF = rpt.list_report_filters()
+        dfRF["Filter Object"] = format_dax_object_name(
+            dfRF["Table Name"], dfRF["Object Name"]
+        )
+        dfPF = rpt.list_page_filters()
 
-    dfPF["Filter Object"] = (
-        dfPF["Page Display Name"]
-        + " : "
-        + format_dax_object_name(dfPF["Table Name"], dfPF["Object Name"])
-    )
-    dfVF = rpt.list_visual_filters()
-    dfVF["Filter Object"] = (
-        format_dax_object_name(dfVF["Page Display Name"], dfVF["Visual Name"])
-        + " : "
-        + format_dax_object_name(dfVF["Table Name"], dfVF["Object Name"])
-    )
-    dfRLM = rpt.list_report_level_measures()
-    dfV = rpt.list_visuals()
-    dfV["Visual Full Name"] = format_dax_object_name(
-        dfV["Page Display Name"], dfV["Visual Name"]
-    )
-    dfSMO = rpt.list_semantic_model_objects(extended=True)
+        dfPF["Filter Object"] = (
+            dfPF["Page Display Name"]
+            + " : "
+            + format_dax_object_name(dfPF["Table Name"], dfPF["Object Name"])
+        )
+        dfVF = rpt.list_visual_filters()
+        dfVF["Filter Object"] = (
+            format_dax_object_name(dfVF["Page Display Name"], dfVF["Visual Name"])
+            + " : "
+            + format_dax_object_name(dfVF["Table Name"], dfVF["Object Name"])
+        )
+        dfRLM = rpt.list_report_level_measures()
+        dfV = rpt.list_visuals()
+        dfV["Visual Full Name"] = format_dax_object_name(
+            dfV["Page Display Name"], dfV["Visual Name"]
+        )
+        dfSMO = rpt.list_semantic_model_objects(extended=True)
 
-    # Translations
-    if rules is None:
-        rules = report_bpa_rules()
+        # Translations
+        if rules is None:
+            rules = report_bpa_rules()
 
-    scope_to_dataframe = {
-        "Custom Visual": (dfCV, ["Custom Visual Display Name"]),
-        "Page": (dfP, ["Page Display Name"]),
-        "Visual": (dfV, ["Visual Full Name"]),
-        "Report Filter": (dfRF, ["Filter Object"]),
-        "Page Filter": (dfPF, ["Filter Object"]),
-        "Visual Filter": (dfVF, ["Filter Object"]),
-        "Report Level Measure": (dfRLM, ["Measure Name"]),
-        "Semantic Model": (dfSMO, ["Report Source Object"]),
-    }
+        scope_to_dataframe = {
+            "Custom Visual": (dfCV, ["Custom Visual Display Name"]),
+            "Page": (dfP, ["Page Display Name"]),
+            "Visual": (dfV, ["Visual Full Name"]),
+            "Report Filter": (dfRF, ["Filter Object"]),
+            "Page Filter": (dfPF, ["Filter Object"]),
+            "Visual Filter": (dfVF, ["Filter Object"]),
+            "Report Level Measure": (dfRLM, ["Measure Name"]),
+            "Semantic Model": (dfSMO, ["Report Source Object"]),
+        }
 
-    def execute_rule(row):
-        scopes = row["Scope"]
+        def execute_rule(row):
+            scopes = row["Scope"]
 
-        # support both str and list as scope type
-        if isinstance(scopes, str):
-            scopes = [scopes]
+            # support both str and list as scope type
+            if isinstance(scopes, str):
+                scopes = [scopes]
 
-        # collect output dataframes
-        df_outputs = []
+            # collect output dataframes
+            df_outputs = []
 
-        for scope in scopes:
-            # common fields for each scope
-            (df, violation_cols_or_func) = scope_to_dataframe[scope]
+            for scope in scopes:
+                # common fields for each scope
+                (df, violation_cols_or_func) = scope_to_dataframe[scope]
 
-            # execute rule and subset df
-            df_violations = df[row["Expression"](df)]
+                # execute rule and subset df
+                df_violations = df[row["Expression"](df)]
 
-            # subset the right output columns (e.g. Table Name & Column Name)
-            if isinstance(violation_cols_or_func, list):
-                violation_func = lambda violations: violations[violation_cols_or_func]
-            else:
-                violation_func = violation_cols_or_func
+                # subset the right output columns (e.g. Table Name & Column Name)
+                if isinstance(violation_cols_or_func, list):
+                    violation_func = lambda violations: violations[
+                        violation_cols_or_func
+                    ]
+                else:
+                    violation_func = violation_cols_or_func
 
-            # build output data frame
-            df_output = violation_func(df_violations).copy()
+                # build output data frame
+                df_output = violation_func(df_violations).copy()
 
-            df_output.columns = ["Object Name"]
-            df_output["Rule Name"] = row["Rule Name"]
-            df_output["Category"] = row["Category"]
+                df_output.columns = ["Object Name"]
+                df_output["Rule Name"] = row["Rule Name"]
+                df_output["Category"] = row["Category"]
 
-            # Handle 'Object Type' based on scope
-            if scope == "Semantic Model":
-                # Ensure 'Report Source Object' is unique in dfSMO
-                dfSMO_unique = dfSMO.drop_duplicates(subset="Report Source Object")
-                # Map 'Object Name' to the 'Report Source' column in dfSMO
-                df_output["Object Type"] = df_output["Object Name"].map(
-                    dfSMO_unique.set_index("Report Source Object")["Report Source"]
-                )
-            else:
-                df_output["Object Type"] = scope
+                # Handle 'Object Type' based on scope
+                if scope == "Semantic Model":
+                    # Ensure 'Report Source Object' is unique in dfSMO
+                    dfSMO_unique = dfSMO.drop_duplicates(subset="Report Source Object")
+                    # Map 'Object Name' to the 'Report Source' column in dfSMO
+                    df_output["Object Type"] = df_output["Object Name"].map(
+                        dfSMO_unique.set_index("Report Source Object")["Report Source"]
+                    )
+                else:
+                    df_output["Object Type"] = scope
 
-            df_output["Severity"] = row["Severity"]
-            df_output["Description"] = row["Description"]
-            df_output["URL"] = row["URL"]
-            df_output["Report URL"] = helper.get_web_url(
-                report=report, workspace=workspace
-            )
+                df_output["Severity"] = row["Severity"]
+                df_output["Description"] = row["Description"]
+                if scope in ["Page", "Page Filter"]:
+                    if not df_output.empty:
+                        for idx, r in df_output.iterrows():
+                            df_output.loc[idx, "URL"] = rpt._get_url(
+                                page_name=r["Object Name"]
+                            )
+                elif scope in ["Visual", "Visual Filter"]:
+                    if not df_output.empty:
+                        for idx, r in df_output.iterrows():
+                            df_output.loc[idx, "URL"] = rpt._get_url(
+                                page_name=r["Object Name"].split("[")[0][1:-1],
+                                visual_name=r["Object Name"].split("[")[1].rstrip("]"),
+                            )
+                else:
+                    df_output["URL"] = rpt._get_url()
+                df_outputs.append(df_output)
 
-            page_mapping_dict = dfP.set_index("Page Display Name")["Page URL"].to_dict()
-
-            if scope == "Page":
-                df_output["Report URL"] = df_output["Object Name"].map(
-                    page_mapping_dict
-                )
-            elif scope == "Page Filter":
-                df_output["Page Name"] = df_output["Object Name"].str.extract(
-                    r"(.*?) : '"
-                )
-                df_output["Report URL"] = df_output["Page Name"].map(page_mapping_dict)
-                df_output.drop(columns=["Page Name"], inplace=True)
-            elif scope in ["Visual", "Visual Filter"]:
-                df_output["Page Name"] = df_output["Object Name"].str.extract(
-                    r"'(.*?)'\[.*?\]"
-                )
-                df_output["Report URL"] = df_output["Page Name"].map(page_mapping_dict)
-                df_output.drop(columns=["Page Name"], inplace=True)
-
-            df_outputs.append(df_output)
-
-        return df_outputs
+            return df_outputs
 
     # flatten list of lists
     flatten_dfs = [
@@ -185,7 +176,7 @@ def run_report_bpa(
             "Severity",
             "Description",
             "URL",
-            "Report URL",
+            # "Report URL",
         ]
     ]
 
@@ -200,31 +191,28 @@ def run_report_bpa(
 
         now = datetime.datetime.now()
         delta_table_name = "reportbparesults"
-        lakehouse_id = fabric.get_lakehouse_id()
-        lake_workspace = fabric.resolve_workspace_name()
-        lakehouse = resolve_lakehouse_name(
-            lakehouse_id=lakehouse_id, workspace=lake_workspace
-        )
-
-        lakeT = get_lakehouse_tables(lakehouse=lakehouse, workspace=lake_workspace)
+        lakeT = get_lakehouse_tables()
         lakeT_filt = lakeT[lakeT["Table Name"] == delta_table_name]
 
         if len(lakeT_filt) == 0:
             runId = 1
         else:
-            max_run_id = _get_max_run_id(
-                lakehouse=lakehouse, table_name=delta_table_name
-            )
+            max_run_id = _get_column_aggregate(table_name=delta_table_name)
             runId = max_run_id + 1
 
+        (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
+        (report_name, report_id) = resolve_item_name_and_id(
+            item=report, type="Report", workspace=workspace_id
+        )
+
         export_df = finalDF.copy()
-        capacity_id, capacity_name = resolve_workspace_capacity(workspace=workspace)
+        capacity_id, capacity_name = resolve_workspace_capacity(workspace=workspace_id)
         export_df["Capacity Name"] = capacity_name
         export_df["Capacity Id"] = capacity_id
-        export_df["Workspace Name"] = workspace
-        export_df["Workspace Id"] = fabric.resolve_workspace_id(workspace)
-        export_df["Report Name"] = report
-        export_df["Report Id"] = resolve_report_id(report, workspace)
+        export_df["Workspace Name"] = workspace_name
+        export_df["Workspace Id"] = workspace_id
+        export_df["Report Name"] = report_name
+        export_df["Report Id"] = report_id
         export_df["RunId"] = runId
         export_df["Timestamp"] = now
         export_df["RunId"] = export_df["RunId"].astype(int)
@@ -273,7 +261,7 @@ def run_report_bpa(
                 "Severity",
                 "Description",
                 "URL",
-                "Report URL",
+                # "Report URL",
             ]
         ]
         .sort_values(["Category", "Rule Name", "Object Type", "Object Name"])
@@ -349,13 +337,12 @@ def run_report_bpa(
             else:
                 content_html += f'<td>{row["Rule Name"]}</td>'
             content_html += f'<td>{row["Object Type"]}</td>'
-            if pd.notnull(row["Report URL"]):
+            if pd.notnull(row["URL"]):
                 content_html += (
-                    f'<td><a href="{row["Report URL"]}">{row["Object Name"]}</a></td>'
+                    f'<td><a href="{row["URL"]}">{row["Object Name"]}</a></td>'
                 )
             else:
                 content_html += f'<td>{row["Object Name"]}</td>'
-            # content_html += f'<td>{row["Object Name"]}</td>'
             content_html += f'<td style="text-align: center;">{row["Severity"]}</td>'
             content_html += "</tr>"
         content_html += "</table>"

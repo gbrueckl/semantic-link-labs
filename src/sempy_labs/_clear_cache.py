@@ -1,39 +1,44 @@
 import sempy.fabric as fabric
 from sempy_labs._helper_functions import (
-    resolve_dataset_id,
     is_default_semantic_model,
     _get_adls_client,
+    resolve_workspace_name_and_id,
+    resolve_dataset_name_and_id,
+    _update_dataframe_datatypes,
+    _base_api,
+    _create_dataframe,
 )
 from typing import Optional
 import sempy_labs._icons as icons
 from sempy._utils._log import log
 import pandas as pd
-from sempy.fabric.exceptions import FabricHTTPException
+from uuid import UUID
 
 
-def clear_cache(dataset: str, workspace: Optional[str] = None):
+@log
+def clear_cache(dataset: str | UUID, workspace: Optional[str | UUID] = None):
     """
     Clears the cache of a semantic model.
     See `here <https://learn.microsoft.com/analysis-services/instances/clear-the-analysis-services-caches?view=asallproducts-allversions>`_ for documentation.
 
     Parameters
     ----------
-    dataset : str
-        Name of the semantic model.
-    workspace : str, default=None
-        The Fabric workspace name.
+    dataset : str | uuid.UUID
+        Name or ID of the semantic model.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
     """
 
-    workspace = fabric.resolve_workspace_name(workspace)
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
     if is_default_semantic_model(dataset=dataset, workspace=workspace):
         raise ValueError(
             f"{icons.red_dot} Cannot run XMLA operations against a default semantic model. Please choose a different semantic model. "
             "See here for more information: https://learn.microsoft.com/fabric/data-warehouse/semantic-models"
         )
 
-    dataset_id = resolve_dataset_id(dataset=dataset, workspace=workspace)
+    (dataset_name, dataset_id) = resolve_dataset_name_and_id(dataset, workspace_id)
 
     xmla = f"""
             <ClearCache xmlns="http://schemas.microsoft.com/analysisservices/2003/engine">
@@ -42,38 +47,41 @@ def clear_cache(dataset: str, workspace: Optional[str] = None):
                 </Object>
             </ClearCache>
             """
-    fabric.execute_xmla(dataset=dataset, xmla_command=xmla, workspace=workspace)
+    fabric.execute_xmla(dataset=dataset_id, xmla_command=xmla, workspace=workspace_id)
     print(
-        f"{icons.green_dot} Cache cleared for the '{dataset}' semantic model within the '{workspace}' workspace."
+        f"{icons.green_dot} Cache cleared for the '{dataset_name}' semantic model within the '{workspace_name}' workspace."
     )
 
 
 @log
 def backup_semantic_model(
-    dataset: str,
+    dataset: str | UUID,
     file_path: str,
     allow_overwrite: bool = True,
     apply_compression: bool = True,
-    workspace: Optional[str] = None,
+    workspace: Optional[str | UUID] = None,
+    password: Optional[str] = None,
 ):
     """
     `Backs up <https://learn.microsoft.com/azure/analysis-services/analysis-services-backup>`_ a semantic model to the ADLS Gen2 storage account connected to the workspace.
 
     Parameters
     ----------
-    dataset : str
-        Name of the semantic model.
+    dataset : str | uuid.UUID
+        Name or ID of the semantic model.
     file_path : str
         The ADLS Gen2 storage account location in which to backup the semantic model. Always saves within the 'power-bi-backup/<workspace name>' folder.
         Must end in '.abf'.
         Example 1: file_path = 'MyModel.abf'
         Example 2: file_path = 'MyFolder/MyModel.abf'
+    password : Optional[str], default=None
+        Password to encrypt the backup file. If None, no password is used.
     allow_overwrite : bool, default=True
         If True, overwrites backup files of the same name. If False, the file you are saving cannot have the same name as a file that already exists in the same location.
     apply_compression : bool, default=True
         If True, compresses the backup file. Compressed backup files save disk space, but require slightly higher CPU utilization.
-    workspace : str, default=None
-        The Fabric workspace name.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
     """
@@ -83,20 +91,24 @@ def backup_semantic_model(
             f"{icons.red_dot} The backup file for restoring must be in the .abf format."
         )
 
-    workspace = fabric.resolve_workspace_name(workspace)
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
+    (dataset_name, dataset_id) = resolve_dataset_name_and_id(dataset, workspace_id)
 
     tmsl = {
         "backup": {
-            "database": dataset,
+            "database": dataset_name,
             "file": file_path,
             "allowOverwrite": allow_overwrite,
             "applyCompression": apply_compression,
         }
     }
 
-    fabric.execute_tmsl(script=tmsl, workspace=workspace)
+    if password:
+        tmsl["backup"]["password"] = password  # Add password only if provided
+
+    fabric.execute_tmsl(script=tmsl, workspace=workspace_id)
     print(
-        f"{icons.green_dot} The '{dataset}' semantic model within the '{workspace}' workspace has been backed up to the '{file_path}' location."
+        f"{icons.green_dot} The '{dataset_name}' semantic model within the '{workspace_name}' workspace has been backed up to the '{file_path}' location."
     )
 
 
@@ -107,7 +119,8 @@ def restore_semantic_model(
     allow_overwrite: bool = True,
     ignore_incompatibilities: bool = True,
     force_restore: bool = False,
-    workspace: Optional[str] = None,
+    workspace: Optional[str | UUID] = None,
+    password: Optional[str] = None,
 ):
     """
     `Restores <https://learn.microsoft.com/power-bi/enterprise/service-premium-backup-restore-dataset>`_ a semantic model based on a backup (.abf) file
@@ -121,25 +134,26 @@ def restore_semantic_model(
         The location in which to backup the semantic model. Must end in '.abf'.
         Example 1: file_path = 'MyModel.abf'
         Example 2: file_path = 'MyFolder/MyModel.abf'
+    password : Optional[str], default=None
+        Password to decrypt the backup file. If None, no password is used.
     allow_overwrite : bool, default=True
         If True, overwrites backup files of the same name. If False, the file you are saving cannot have the same name as a file that already exists in the same location.
     ignore_incompatibilities : bool, default=True
         If True, ignores incompatibilities between Azure Analysis Services and Power BI Premium.
     force_restore: bool, default=False
         If True, restores the semantic model with the existing semantic model unloaded and offline.
-    workspace : str, default=None
-        The Fabric workspace name.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
     """
-    # https://learn.microsoft.com/en-us/power-bi/enterprise/service-premium-backup-restore-dataset
 
     if not file_path.endswith(".abf"):
         raise ValueError(
             f"{icons.red_dot} The backup file for restoring must be in the .abf format."
         )
 
-    workspace = fabric.resolve_workspace_name(workspace)
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
 
     tmsl = {
         "restore": {
@@ -151,13 +165,16 @@ def restore_semantic_model(
         }
     }
 
+    if password:
+        tmsl["restore"]["password"] = password
+
     if force_restore:
         tmsl["restore"]["forceRestore"] = force_restore
 
-    fabric.execute_tmsl(script=tmsl, workspace=workspace)
+    fabric.execute_tmsl(script=tmsl, workspace=workspace_id)
 
     print(
-        f"{icons.green_dot} The '{dataset}' semantic model has been restored to the '{workspace}' workspace based on teh '{file_path}' backup file."
+        f"{icons.green_dot} The '{dataset}' semantic model has been restored to the '{workspace_name}' workspace based on the '{file_path}' backup file."
     )
 
 
@@ -243,15 +260,15 @@ def copy_semantic_model_backup_file(
 
 
 @log
-def list_backups(workspace: Optional[str] = None) -> pd.DataFrame:
+def list_backups(workspace: Optional[str | UUID] = None) -> pd.DataFrame:
     """
     Shows a list of backup files contained within a workspace's ADLS Gen2 storage account.
     Requirement: An ADLS Gen2 storage account must be `connected to the workspace <https://learn.microsoft.com/power-bi/transform-model/dataflows/dataflows-azure-data-lake-storage-integration#connect-to-an-azure-data-lake-gen-2-at-a-workspace-level>`_.
 
     Parameters
     ----------
-    workspace : str, default=None
-        The Fabric workspace name.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
 
@@ -261,20 +278,15 @@ def list_backups(workspace: Optional[str] = None) -> pd.DataFrame:
         A pandas dataframe showing a list of backup files contained within a workspace's ADLS Gen2 storage account.
     """
 
-    client = fabric.PowerBIRestClient()
-    workspace = fabric.resolve_workspace_name(workspace)
-    workspace_id = fabric.resolve_workspace_id(workspace)
-    response = client.get(
-        f"/v1.0/myorg/resources?resourceType=StorageAccount&folderObjectId={workspace_id}"
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
+    response = _base_api(
+        request=f"/v1.0/myorg/resources?resourceType=StorageAccount&folderObjectId={workspace_id}"
     )
-
-    if response.status_code != 200:
-        raise FabricHTTPException(response)
 
     v = response.json().get("value", [])
     if not v:
         raise ValueError(
-            f"{icons.red_dot} A storage account is not associated with the '{workspace}' workspace."
+            f"{icons.red_dot} A storage account is not associated with the '{workspace_name}' workspace."
         )
     storage_account = v[0]["resourceName"]
 
@@ -305,33 +317,35 @@ def list_storage_account_files(
         A pandas dataframe showing a list of files contained within an ADLS Gen2 storage account.
     """
 
-    df = pd.DataFrame(
-        columns=[
-            "File Path",
-            "File Size",
-            "Creation Time",
-            "Last Modified",
-            "Expiry Time",
-            "Encryption Scope",
-        ]
-    )
+    columns = {
+        "File Path": "str",
+        "File Size": "int",
+        "Creation Time": "datetime",
+        "Last Modified": "datetime",
+        "Expiry Time": "datetime",
+        "Encryption Scope": "str",
+    }
 
-    onelake = _get_adls_client(storage_account)
-    fs = onelake.get_file_system_client(container)
+    df = _create_dataframe(columns=columns)
+    client = _get_adls_client(storage_account)
+    fs = client.get_file_system_client(container)
 
+    rows = []
     for x in list(fs.get_paths()):
         if not x.is_directory:
-            new_data = {
-                "File Path": x.name,
-                "File Size": x.content_length,
-                "Creation Time": x.creation_time,
-                "Last Modified": x.last_modified,
-                "Expiry Time": x.expiry_time,
-                "Encryption Scope": x.encryption_scope,
-            }
+            rows.append(
+                {
+                    "File Path": x.name,
+                    "File Size": x.content_length,
+                    "Creation Time": x.creation_time,
+                    "Last Modified": x.last_modified,
+                    "Expiry Time": x.expiry_time,
+                    "Encryption Scope": x.encryption_scope,
+                }
+            )
 
-            df = pd.concat([df, pd.DataFrame(new_data, index=[0])], ignore_index=True)
-
-    df["File Size"] = df["File Size"].astype(int)
+    if rows:
+        df = pd.DataFrame(rows)
+        _update_dataframe_datatypes(dataframe=df, column_map=columns)
 
     return df

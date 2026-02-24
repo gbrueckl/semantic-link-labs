@@ -6,63 +6,61 @@ from typing import Optional
 from sempy_labs._helper_functions import (
     resolve_workspace_name_and_id,
     _conv_b64,
-    resolve_report_id,
-    lro,
+    resolve_dataset_name_and_id,
+    resolve_item_name_and_id,
+    _update_dataframe_datatypes,
+    _base_api,
+    resolve_item_id,
+    _get_item_definition,
 )
 import sempy_labs._icons as icons
 from sempy._utils._log import log
+from uuid import UUID
 
 
+@log
 def create_report_from_reportjson(
     report: str,
-    dataset: str,
+    dataset: str | UUID,
     report_json: dict,
     theme_json: Optional[dict] = None,
-    workspace: Optional[str] = None,
+    workspace: Optional[str | UUID] = None,
 ):
     """
     Creates a report based on a report.json file (and an optional themes.json file).
 
     This is a wrapper function for the following API: `Items - Create Report <https://learn.microsoft.com/rest/api/fabric/report/items/create-report>`_.
 
+    Service Principal Authentication is supported (see `here <https://github.com/microsoft/semantic-link-labs/blob/main/notebooks/Service%20Principal.ipynb>`_ for examples).
+
     Parameters
     ----------
     report : str
         Name of the report.
-    dataset : str
-        Name of the semantic model to connect to the report.
+    dataset : str | uuid.UUID
+        Name or ID of the semantic model to connect to the report.
     report_json : dict
         The report.json file to be used to create the report.
     theme_json : dict, default=None
         The theme.json file to be used for the theme of the report.
-    workspace : str, default=None
-        The Fabric workspace name.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
     """
 
-    (workspace, workspace_id) = resolve_workspace_name_and_id(workspace)
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
+    (dataset_name, dataset_id) = resolve_dataset_name_and_id(dataset, workspace_id)
 
-    dfI = fabric.list_items(workspace=workspace)
+    dfI = fabric.list_items(workspace=workspace, type="Report")
+    dfI_rpt = dfI[dfI["Display Name"] == report]
 
-    dfI_model = dfI[(dfI["Display Name"] == dataset) & (dfI["Type"] == "SemanticModel")]
-
-    if len(dfI_model) == 0:
-        raise ValueError(
-            f"{icons.red_dot} The '{dataset}' semantic model does not exist in the '{workspace}' workspace."
-        )
-
-    datasetId = dfI_model["Id"].iloc[0]
-
-    dfI_rpt = dfI[(dfI["Display Name"] == report) & (dfI["Type"] == "Report")]
-
-    if len(dfI_rpt) > 0:
+    if not dfI_rpt.empty:
         print(
-            f"{icons.yellow_dot} '{report}' already exists as a report in the '{workspace}' workspace."
+            f"{icons.yellow_dot} '{report}' report already exists in the '{workspace_name}' workspace."
         )
         return
 
-    client = fabric.FabricRestClient()
     defPBIR = {
         "version": "1.0",
         "datasetReference": {
@@ -71,7 +69,7 @@ def create_report_from_reportjson(
                 "connectionString": None,
                 "pbiServiceModelId": None,
                 "pbiModelVirtualServerName": "sobe_wowvirtualserver",
-                "pbiModelDatabaseName": datasetId,
+                "pbiModelDatabaseName": dataset_id,
                 "name": "EntityDataSource",
                 "connectionType": "pbiServiceXmlaStyleLive",
             },
@@ -111,45 +109,53 @@ def create_report_from_reportjson(
         }
         request_body["definition"]["parts"].append(part)
 
-    response = client.post(f"/v1/workspaces/{workspace_id}/reports", json=request_body)
-
-    lro(client, response, status_codes=[201, 202], return_status_code=True)
+    _base_api(
+        request=f"/v1/workspaces/{workspace_id}/reports",
+        method="post",
+        payload=request_body,
+        lro_return_status_code=True,
+        status_codes=[201, 202],
+        client="fabric_sp",
+    )
 
     print(
-        f"{icons.green_dot} Succesfully created the '{report}' report within the '{workspace}' workspace."
+        f"{icons.green_dot} Succesfully created the '{report}' report within the '{workspace_name}' workspace."
     )
 
 
+@log
 def update_report_from_reportjson(
-    report: str, report_json: dict, workspace: Optional[str] = None
+    report: str | UUID, report_json: dict, workspace: Optional[str | UUID] = None
 ):
     """
     Updates a report based on a report.json file.
 
     This is a wrapper function for the following API: `Items - Update Report Definition <https://learn.microsoft.com/rest/api/fabric/report/items/update-report-definition>`_.
 
+    Service Principal Authentication is supported (see `here <https://github.com/microsoft/semantic-link-labs/blob/main/notebooks/Service%20Principal.ipynb>`_ for examples).
+
     Parameters
     ----------
-    report : str
-        Name of the report.
+    report : str | uuid.UUID
+        Name or ID of the report.
     report_json : dict
         The report.json file to be used to update the report.
-    workspace : str, default=None
-        The Fabric workspace name in which the report resides.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID in which the report resides.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
     """
 
-    (workspace, workspace_id) = resolve_workspace_name_and_id(workspace)
-    report_id = resolve_report_id(report=report, workspace=workspace)
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
+    report_id = resolve_item_id(item=report, type="Report", workspace=workspace)
 
     # Get the existing PBIR file
-    df_items = get_report_definition(report=report, workspace=workspace)
+    df_items = get_report_definition(report=report, workspace=workspace_id)
     df_items_filt = df_items[df_items["path"] == "definition.pbir"]
     rptDefFile = df_items_filt["payload"].iloc[0]
     payloadReportJson = _conv_b64(report_json)
 
-    request_body = {
+    payload = {
         "definition": {
             "parts": [
                 {
@@ -166,33 +172,43 @@ def update_report_from_reportjson(
         }
     }
 
-    client = fabric.FabricRestClient()
-    response = client.post(
-        f"/v1/workspaces/{workspace_id}/reports/{report_id}/updateDefinition",
-        json=request_body,
+    _base_api(
+        request=f"/v1/workspaces/{workspace_id}/reports/{report_id}/updateDefinition",
+        method="post",
+        payload=payload,
+        lro_return_status_code=True,
+        status_codes=None,
+        client="fabric_sp",
     )
-
-    lro(client, response, return_status_code=True)
 
     print(
-        f"{icons.green_dot} The '{report}' report within the '{workspace}' workspace has been successfully updated."
+        f"{icons.green_dot} The '{report}' report within the '{workspace_name}' workspace has been successfully updated."
     )
 
 
-def get_report_definition(report: str, workspace: Optional[str] = None) -> pd.DataFrame:
+@log
+def get_report_definition(
+    report: str | UUID,
+    workspace: Optional[str | UUID] = None,
+    return_dataframe: bool = True,
+) -> pd.DataFrame | dict:
     """
     Gets the collection of definition files of a report.
 
     This is a wrapper function for the following API: `Items - Get Report Definition <https://learn.microsoft.com/rest/api/fabric/report/items/get-report-definition>`_.
 
+    Service Principal Authentication is supported (see `here <https://github.com/microsoft/semantic-link-labs/blob/main/notebooks/Service%20Principal.ipynb>`_ for examples).
+
     Parameters
     ----------
-    report : str
-        Name of the report.
-    workspace : str, default=None
-        The Fabric workspace name in which the report resides.
+    report : str | uuid.UUID
+        Name or ID of the report.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID in which the report resides.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
+    return_dataframe : bool, default=True
+        If True, returns a dataframe. If False, returns a json dictionary.
 
     Returns
     -------
@@ -200,25 +216,19 @@ def get_report_definition(report: str, workspace: Optional[str] = None) -> pd.Da
         The collection of report definition files within a pandas dataframe.
     """
 
-    (workspace, workspace_id) = resolve_workspace_name_and_id(workspace)
-
-    report_id = resolve_report_id(report=report, workspace=workspace)
-    client = fabric.FabricRestClient()
-    response = client.post(
-        f"/v1/workspaces/{workspace_id}/reports/{report_id}/getDefinition",
+    return _get_item_definition(
+        item=report,
+        type="Report",
+        workspace=workspace,
+        return_dataframe=return_dataframe,
     )
-
-    result = lro(client, response).json()
-    rdef = pd.json_normalize(result["definition"]["parts"])
-
-    return rdef
 
 
 @log
 def create_model_bpa_report(
     report: Optional[str] = icons.model_bpa_name,
     dataset: Optional[str] = icons.model_bpa_name,
-    dataset_workspace: Optional[str] = None,
+    dataset_workspace: Optional[str | UUID] = None,
 ):
     """
     Dynamically generates a Best Practice Analyzer report for analyzing semantic models.
@@ -231,24 +241,25 @@ def create_model_bpa_report(
     dataset : str, default='ModelBPA'
         Name of the semantic model which feeds this report.
         Defaults to 'ModelBPA'
-    dataset_workspace : str, default=None
-        The Fabric workspace name in which the semantic model resides.
+    dataset_workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID in which the semantic model resides.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
 
     """
+    (dataset_workspace_name, dataset_workspace_id) = resolve_workspace_name_and_id(
+        dataset_workspace
+    )
 
-    # from sempy_labs._helper_functions import resolve_dataset_id
-
-    dfI = fabric.list_items(workspace=dataset_workspace, type="SemanticModel")
+    dfI = fabric.list_items(workspace=dataset_workspace_id, type="SemanticModel")
     dfI_filt = dfI[dfI["Display Name"] == dataset]
 
     if len(dfI_filt) == 0:
         raise ValueError(
-            f"The '{dataset}' semantic model does not exist within the '{dataset_workspace}' workspace."
+            f"The '{dataset}' semantic model does not exist within the '{dataset_workspace_name}' workspace."
         )
 
-    dfR = fabric.list_reports(workspace=dataset_workspace)
+    dfR = fabric.list_reports(workspace=dataset_workspace_id)
     dfR_filt = dfR[dfR["Name"] == report]
     # dataset_id = resolve_dataset_id(dataset=dataset, workspace=dataset_workspace)
 
@@ -300,14 +311,14 @@ def create_model_bpa_report(
 
     if len(dfR_filt) > 0:
         update_report_from_reportjson(
-            report=report, report_json=report_json, workspace=dataset_workspace
+            report=report, report_json=report_json, workspace=dataset_workspace_id
         )
     else:
         create_report_from_reportjson(
             report=report,
             dataset=dataset,
             report_json=report_json,
-            workspace=dataset_workspace,
+            workspace=dataset_workspace_id,
         )
 
 
@@ -322,43 +333,45 @@ def _create_report(
 
     from sempy_labs.report import report_rebind
 
-    report_workspace = fabric.resolve_workspace_name(report_workspace)
-    report_workspace_id = fabric.resolve_workspace_id(report_workspace)
-    dataset_workspace = fabric.resolve_workspace_name(dataset_workspace)
+    (report_workspace_name, report_workspace_id) = resolve_workspace_name_and_id(
+        workspace=report_workspace
+    )
 
     dfR = fabric.list_reports(workspace=report_workspace)
     dfR_filt = dfR[dfR["Name"] == report]
 
     updated_report = False
-    client = fabric.FabricRestClient()
     # Create report if it does not exist
-    if len(dfR_filt) == 0:
-        response = client.post(
-            f"/v1/workspaces/{report_workspace_id}/reports",
-            json=request_body,
+    if dfR_filt.empty:
+        _base_api(
+            request=f"/v1/workspaces/{report_workspace_id}/reports",
+            method="post",
+            payload=request_body,
+            lro_return_status_code=True,
+            status_codes=[201, 202],
         )
 
-        lro(client, response, status_codes=[201, 202], return_status_code=True)
-
         print(
-            f"{icons.green_dot} The '{report}' report has been created within the '{report_workspace}'"
+            f"{icons.green_dot} The '{report}' report has been created within the '{report_workspace_name}'"
         )
         updated_report = True
     # Update the report if it exists
-    elif len(dfR_filt) > 0 and overwrite:
+    elif not dfR_filt.empty and overwrite:
         report_id = dfR_filt["Id"].iloc[0]
-        response = client.post(
-            f"/v1/workspaces/{report_workspace_id}/reports/{report_id}/updateDefinition",
-            json=request_body,
+        _base_api(
+            request=f"/v1/workspaces/{report_workspace_id}/reports/{report_id}/updateDefinition",
+            method="post",
+            payload=request_body,
+            lro_return_status_code=True,
+            status_codes=None,
         )
-        lro(client, response, return_status_code=True)
         print(
-            f"{icons.green_dot} The '{report}' report has been updated within the '{report_workspace}'"
+            f"{icons.green_dot} The '{report}' report has been updated within the '{report_workspace_name}'"
         )
         updated_report = True
     else:
         raise ValueError(
-            f"{icons.red_dot} The '{report}' report within the '{report_workspace}' workspace already exists and the 'overwrite' parameter was set to False."
+            f"{icons.red_dot} The '{report}' report within the '{report_workspace_name}' workspace already exists and the 'overwrite' parameter was set to False."
         )
 
     # Rebind the report to the semantic model to make sure it is pointed at the correct semantic model
@@ -369,3 +382,46 @@ def _create_report(
             report_workspace=report_workspace,
             dataset_workspace=dataset_workspace,
         )
+
+
+def _get_report(
+    report: str | UUID, workspace: Optional[str | UUID] = None
+) -> pd.DataFrame:
+
+    (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
+    (report_name, report_id) = resolve_item_name_and_id(
+        item=report, type="Report", workspace=workspace
+    )
+
+    response = _base_api(
+        request=f"v1.0/myorg/groups/{workspace_id}/reports/{report_id}"
+    )
+    result = response.json()
+
+    new_data = {
+        "Id": result.get("id"),
+        "Report Type": result.get("reportType"),
+        "Name": result.get("name"),
+        "Web Url": result.get("webUrl"),
+        "Embed Url": result.get("embedUrl"),
+        "Is From Pbix": result.get("isFromPbix"),
+        "Is Owned By Me": result.get("isOwnedByMe"),
+        "Dataset Id": result.get("datasetId"),
+        "Dataset Workspace Id": result.get("datasetWorkspaceId"),
+        "Users": result.get("users") if result.get("users") is not None else [],
+        "Subscriptions": (
+            result.get("subscriptions")
+            if result.get("subscriptions") is not None
+            else []
+        ),
+    }
+
+    df = pd.DataFrame([new_data])
+
+    column_map = {
+        "Is From Pbix": "bool",
+        "Is Owned By Me": "bool",
+    }
+    _update_dataframe_datatypes(dataframe=df, column_map=column_map)
+
+    return df

@@ -2,43 +2,46 @@ import sempy.fabric as fabric
 from typing import Optional, List
 from sempy._utils._log import log
 import sempy_labs._icons as icons
-from sempy.fabric.exceptions import FabricHTTPException
 from sempy_labs._workspaces import assign_workspace_to_capacity
-from sempy_labs.admin._basic_functions import (
+from sempy_labs.admin import (
     assign_workspaces_to_capacity,
+)
+from sempy_labs.admin._capacities import (
     _list_capacities_meta,
     list_capacities,
 )
 from sempy_labs._helper_functions import (
     resolve_capacity_id,
     convert_to_alphanumeric_lowercase,
+    _base_api,
 )
 from sempy_labs._capacities import create_fabric_capacity
+from uuid import UUID
 
 
-def migrate_settings(source_capacity: str, target_capacity: str):
+def _migrate_settings(source_capacity: str, target_capacity: str):
 
-    migrate_capacity_settings(
+    _migrate_capacity_settings(
         source_capacity=source_capacity,
         target_capacity=target_capacity,
     )
-    migrate_access_settings(
+    _migrate_access_settings(
         source_capacity=source_capacity,
         target_capacity=target_capacity,
     )
-    migrate_notification_settings(
+    _migrate_notification_settings(
         source_capacity=source_capacity,
         target_capacity=target_capacity,
     )
-    migrate_spark_settings(
+    _migrate_spark_settings(
         source_capacity=source_capacity,
         target_capacity=target_capacity,
     )
-    migrate_delegated_tenant_settings(
+    _migrate_delegated_tenant_settings(
         source_capacity=source_capacity,
         target_capacity=target_capacity,
     )
-    migrate_disaster_recovery_settings(
+    _migrate_disaster_recovery_settings(
         source_capacity=source_capacity,
         target_capacity=target_capacity,
     )
@@ -103,17 +106,13 @@ def migrate_workspaces(
     migrated_workspaces = []
 
     for i, r in dfW.iterrows():
-        workspace = r["Name"]
-
-        if workspaces is None or workspace in workspaces:
-            pass
-        else:
-            continue
-
-        if assign_workspace_to_capacity(
-            capacity_name=target_capacity, workspace=workspace
-        ):
-            migrated_workspaces.append(workspace)
+        workspace_id = r["Id"]
+        workspace_name = r["Name"]
+        if workspaces is None or workspace_name in workspaces:
+            assign_workspace_to_capacity(
+                capacity=target_capacity, workspace=workspace_id
+            )
+            migrated_workspaces.append(workspace_name)
 
     if len(migrated_workspaces) < workspace_count:
         print(
@@ -121,10 +120,11 @@ def migrate_workspaces(
         )
         print(f"{icons.in_progress} Initiating rollback...")
         for i, r in dfW.iterrows():
-            workspace = r["Name"]
-            if workspace in migrated_workspaces:
+            workspace_id = r["Id"]
+            workspace_name = r["Name"]
+            if workspace_name in migrated_workspaces:
                 assign_workspace_to_capacity(
-                    capacity_name=source_capacity, workspace=workspace
+                    capacity=source_capacity, workspace=workspace_id
                 )
         print(
             f"{icons.green_dot} Rollback of the workspaces to the '{source_capacity}' capacity is complete."
@@ -138,14 +138,11 @@ def migrate_workspaces(
 @log
 def migrate_capacities(
     azure_subscription_id: str,
-    key_vault_uri: str,
-    key_vault_tenant_id: str,
-    key_vault_client_id: str,
-    key_vault_client_secret: str,
     resource_group: str | dict,
     capacities: Optional[str | List[str]] = None,
     use_existing_rg_for_A_sku: bool = True,
     p_sku_only: bool = True,
+    **kwargs,
 ):
     """
     This function creates new Fabric capacities for given A or P sku capacities and reassigns their workspaces to the newly created capacity.
@@ -154,14 +151,6 @@ def migrate_capacities(
     ----------
     azure_subscription_id : str
         The Azure subscription ID.
-    key_vault_uri : str
-        The name of the `Azure key vault <https://azure.microsoft.com/products/key-vault>`_ URI. Example: "https://<Key Vault Name>.vault.azure.net/"
-    key_vault_tenant_id : str
-        The name of the Azure key vault secret storing the Tenant ID.
-    key_vault_client_id : str
-        The name of the Azure key vault secret storing the Client ID.
-    key_vault_client_secret : str
-        The name of the Azure key vault secret storing the Client Secret.
     resource_group : str | dict
         The name of the Azure resource group.
         For A skus, this parameter will be ignored and the resource group used for the F sku will be the same as the A sku's resource group.
@@ -233,10 +222,6 @@ def migrate_capacities(
                 create_fabric_capacity(
                     capacity_name=tgt_capacity,
                     azure_subscription_id=azure_subscription_id,
-                    key_vault_uri=key_vault_uri,
-                    key_vault_tenant_id=key_vault_tenant_id,
-                    key_vault_client_id=key_vault_client_id,
-                    key_vault_client_secret=key_vault_client_secret,
                     resource_group=rg,
                     region=region,
                     sku=icons.sku_mapping.get(sku_size),
@@ -248,11 +233,11 @@ def migrate_capacities(
             )
 
             # Migrate settings to new capacity
-            migrate_settings(source_capacity=cap_name, target_capacity=tgt_capacity)
+            # _migrate_settings(source_capacity=cap_name, target_capacity=tgt_capacity)
 
 
 @log
-def migrate_capacity_settings(source_capacity: str, target_capacity: str):
+def _migrate_capacity_settings(source_capacity: str, target_capacity: str):
     """
     This function migrates a capacity's settings to another capacity.
 
@@ -280,13 +265,9 @@ def migrate_capacity_settings(source_capacity: str, target_capacity: str):
 
     workloads_params = "capacityCustomParameters?workloadIds=ADM&workloadIds=CDSA&workloadIds=DMS&workloadIds=RsRdlEngine&workloadIds=ScreenshotEngine&workloadIds=AS&workloadIds=QES&workloadIds=DMR&workloadIds=ESGLake&workloadIds=NLS&workloadIds=lake&workloadIds=TIPS&workloadIds=Kusto&workloadIds=Lakehouse&workloadIds=SparkCore&workloadIds=DI&workloadIds=Notebook&workloadIds=ML&workloadIds=ES&workloadIds=Reflex&workloadIds=Must&workloadIds=dmh&workloadIds=PowerBI&workloadIds=HLS"
 
-    client = fabric.PowerBIRestClient()
-    response_get_source = client.get(
-        f"capacities/{source_capacity_id}/{workloads_params}"
+    response_get_source = _base_api(
+        request=f"capacities/{source_capacity_id}/{workloads_params}"
     )
-    if response_get_source.status_code != 200:
-        raise FabricHTTPException(response_get_source)
-
     response_source_json = response_get_source.json().get(
         "capacityCustomParameters", {}
     )
@@ -332,12 +313,12 @@ def migrate_capacity_settings(source_capacity: str, target_capacity: str):
                             "workloadCustomParameters"
                         ][setting_name] = setting_value
 
-    response_put = client.put(
-        f"capacities/{target_capacity_id}/{workloads_params}",
-        json=settings_json,
+    _base_api(
+        request=f"capacities/{target_capacity_id}/{workloads_params}",
+        method="put",
+        payload=settings_json,
+        status_codes=204,
     )
-    if response_put.status_code != 204:
-        raise FabricHTTPException(response_put)
 
     print(
         f"{icons.green_dot} The capacity settings have been migrated from the '{source_capacity}' capacity to the '{target_capacity}' capacity."
@@ -345,7 +326,7 @@ def migrate_capacity_settings(source_capacity: str, target_capacity: str):
 
 
 @log
-def migrate_disaster_recovery_settings(source_capacity: str, target_capacity: str):
+def _migrate_disaster_recovery_settings(source_capacity: str, target_capacity: str):
     """
     This function migrates a capacity's disaster recovery settings to another capacity.
 
@@ -371,28 +352,25 @@ def migrate_disaster_recovery_settings(source_capacity: str, target_capacity: st
         )
     target_capacity_id = dfC_filt["Capacity Id"].iloc[0].upper()
 
-    client = fabric.PowerBIRestClient()
-    response_get_source = client.get(f"capacities/{source_capacity_id}/config")
-    if response_get_source.status_code != 200:
-        raise FabricHTTPException(response_get_source)
+    response_get_source = _base_api(request=f"capacities/{source_capacity_id}/config")
 
-    request_body = {}
+    payload = {}
     value = response_get_source.json()["bcdr"]["config"]
-    request_body["config"] = value
+    payload["config"] = value
 
-    response_put = client.put(
-        f"capacities/{target_capacity_id}/fabricbcdr", json=request_body
+    _base_api(
+        request=f"capacities/{target_capacity_id}/fabricbcdr",
+        payload=payload,
+        status_codes=202,
+        method="put",
     )
-
-    if response_put.status_code != 202:
-        raise FabricHTTPException(response_put)
     print(
         f"{icons.green_dot} The disaster recovery settings have been migrated from the '{source_capacity}' capacity to the '{target_capacity}' capacity."
     )
 
 
 @log
-def migrate_access_settings(source_capacity: str, target_capacity: str):
+def _migrate_access_settings(source_capacity: str, target_capacity: str):
     """
     This function migrates the access settings from a source capacity to a target capacity.
 
@@ -406,31 +384,28 @@ def migrate_access_settings(source_capacity: str, target_capacity: str):
 
     dfC = list_capacities()
     dfC_filt = dfC[dfC["Capacity Name"] == source_capacity]
-    if len(dfC_filt) == 0:
+    if dfC_filt.empty:
         raise ValueError(
             f"{icons.red_dot} The '{source_capacity}' capacity does not exist."
         )
     source_capacity_id = dfC_filt["Capacity Id"].iloc[0].upper()
     dfC_filt = dfC[dfC["Capacity Name"] == target_capacity]
-    if len(dfC_filt) == 0:
+    if dfC_filt.empty:
         raise ValueError(
             f"{icons.red_dot} The '{target_capacity}' capacity does not exist."
         )
     target_capacity_id = dfC_filt["Capacity Id"].iloc[0].upper()
 
-    client = fabric.PowerBIRestClient()
-    response_get_source = client.get(f"capacities/{source_capacity_id}")
-    if response_get_source.status_code != 200:
-        raise FabricHTTPException(response_get_source)
+    response_get_source = _base_api(request=f"capacities/{source_capacity_id}")
 
-    access_settings = response_get_source.json().get("access", {})
+    payload = response_get_source.json().get("access", {})
 
-    response_put = client.put(
-        f"capacities/{target_capacity_id}/access",
-        json=access_settings,
+    _base_api(
+        request=f"capacities/{target_capacity_id}/access",
+        method="put",
+        payload=payload,
+        status_codes=204,
     )
-    if response_put.status_code != 204:
-        raise FabricHTTPException(response_put)
 
     print(
         f"{icons.green_dot} The access settings have been migrated from the '{source_capacity}' capacity to the '{target_capacity}' capacity."
@@ -438,7 +413,7 @@ def migrate_access_settings(source_capacity: str, target_capacity: str):
 
 
 @log
-def migrate_notification_settings(source_capacity: str, target_capacity: str):
+def _migrate_notification_settings(source_capacity: str, target_capacity: str):
     """
     This function migrates the notification settings from a source capacity to a target capacity.
 
@@ -452,33 +427,28 @@ def migrate_notification_settings(source_capacity: str, target_capacity: str):
 
     dfC = list_capacities()
     dfC_filt = dfC[dfC["Capacity Name"] == source_capacity]
-    if len(dfC_filt) == 0:
+    if dfC_filt.empty:
         raise ValueError(
             f"{icons.red_dot} The '{source_capacity}' capacity does not exist."
         )
     source_capacity_id = dfC_filt["Capacity Id"].iloc[0].upper()
     dfC_filt = dfC[dfC["Capacity Name"] == target_capacity]
-    if len(dfC_filt) == 0:
+    if dfC_filt.empty:
         raise ValueError(
             f"{icons.red_dot} The '{target_capacity}' capacity does not exist."
         )
     target_capacity_id = dfC_filt["Capacity Id"].iloc[0].upper()
 
-    client = fabric.PowerBIRestClient()
-    response_get_source = client.get(f"capacities/{source_capacity_id}")
-    if response_get_source.status_code != 200:
-        raise FabricHTTPException(response_get_source)
+    response_get_source = _base_api(request=f"capacities/{source_capacity_id}")
 
-    notification_settings = response_get_source.json().get(
-        "capacityNotificationSettings", {}
-    )
+    payload = response_get_source.json().get("capacityNotificationSettings", {})
 
-    response_put = client.put(
-        f"capacities/{target_capacity_id}/notificationSettings",
-        json=notification_settings,
+    _base_api(
+        request=f"capacities/{target_capacity_id}/notificationSettings",
+        method="put",
+        payload=payload,
+        status_codes=204,
     )
-    if response_put.status_code != 204:
-        raise FabricHTTPException(response_put)
 
     print(
         f"{icons.green_dot} The notification settings have been migrated from the '{source_capacity}' capacity to the '{target_capacity}' capacity."
@@ -486,7 +456,7 @@ def migrate_notification_settings(source_capacity: str, target_capacity: str):
 
 
 @log
-def migrate_delegated_tenant_settings(source_capacity: str, target_capacity: str):
+def _migrate_delegated_tenant_settings(source_capacity: str, target_capacity: str):
     """
     This function migrates the delegated tenant settings from a source capacity to a target capacity.
 
@@ -501,24 +471,20 @@ def migrate_delegated_tenant_settings(source_capacity: str, target_capacity: str
     dfC = list_capacities()
 
     dfC_filt = dfC[dfC["Capacity Name"] == source_capacity]
-    if len(dfC_filt) == 0:
+    if dfC_filt.empty:
         raise ValueError(
             f"{icons.red_dot} The '{source_capacity}' capacity does not exist."
         )
     source_capacity_id = dfC_filt["Capacity Id"].iloc[0].upper()
 
     dfC_filt = dfC[dfC["Capacity Name"] == target_capacity]
-    if len(dfC_filt) == 0:
+    if dfC_filt.empty:
         raise ValueError(
             f"{icons.red_dot} The '{target_capacity}' capacity does not exist."
         )
     target_capacity_id = dfC_filt["Capacity Id"].iloc[0].upper()
 
-    client = fabric.FabricRestClient()
-    response_get = client.get("v1/admin/capacities/delegatedTenantSettingOverrides")
-
-    if response_get.status_code != 200:
-        raise FabricHTTPException(response_get)
+    response_get = _base_api("v1/admin/capacities/delegatedTenantSettingOverrides")
 
     response_json = response_get.json().get("Overrides", [])
 
@@ -551,13 +517,11 @@ def migrate_delegated_tenant_settings(source_capacity: str, target_capacity: str
 
                 payload = {"featureSwitches": [feature_switch], "properties": []}
 
-                client = fabric.PowerBIRestClient()
-                response_put = client.put(
-                    f"metadata/tenantsettings/selfserve?capacityObjectId={target_capacity_id}",
-                    json=payload,
+                _base_api(
+                    request=f"metadata/tenantsettings/selfserve?capacityObjectId={target_capacity_id}",
+                    method="put",
+                    payload=payload,
                 )
-                if response_put.status_code != 200:
-                    raise FabricHTTPException(response_put)
 
                 print(
                     f"{icons.green_dot} The delegated tenant settings for the '{setting_name}' feature switch of the '{source_capacity}' capacity have been migrated to the '{target_capacity}' capacity."
@@ -565,7 +529,7 @@ def migrate_delegated_tenant_settings(source_capacity: str, target_capacity: str
 
 
 @log
-def migrate_spark_settings(source_capacity: str, target_capacity: str):
+def _migrate_spark_settings(source_capacity: str | UUID, target_capacity: str | UUID):
     """
     This function migrates a capacity's spark settings to another capacity.
 
@@ -573,29 +537,22 @@ def migrate_spark_settings(source_capacity: str, target_capacity: str):
 
     Parameters
     ----------
-    source_capacity : str
-        Name of the source capacity.
-    target_capacity : str
-        Name of the target capacity.
+    source_capacity : str | uuid.UUID
+        Name or ID of the source capacity.
+    target_capacity : str | uuid.UUID
+        Name or ID of the target capacity.
     """
 
-    source_capacity_id = resolve_capacity_id(capacity_name=source_capacity)
-    target_capacity_id = resolve_capacity_id(capacity_name=target_capacity)
-    client = fabric.PowerBIRestClient()
+    source_capacity_id = resolve_capacity_id(capacity=source_capacity)
+    target_capacity_id = resolve_capacity_id(capacity=target_capacity)
 
     # Get source capacity server dns
-    response = client.get(f"metadata/capacityInformation/{source_capacity_id}")
-    if response.status_code != 200:
-        raise FabricHTTPException(response)
-
+    response = _base_api(request=f"metadata/capacityInformation/{source_capacity_id}")
     source_server_dns = response.json().get("capacityDns")
     source_url = f"{source_server_dns}/webapi/capacities"
 
     # Get target capacity server dns
-    response = client.get(f"metadata/capacityInformation/{target_capacity_id}")
-    if response.status_code != 200:
-        raise FabricHTTPException(response)
-
+    response = _base_api(request=f"metadata/capacityInformation/{target_capacity_id}")
     target_server_dns = response.json().get("capacityDns")
     target_url = f"{target_server_dns}/webapi/capacities"
 
@@ -605,17 +562,11 @@ def migrate_spark_settings(source_capacity: str, target_capacity: str):
     put_url = f"{target_url}/{target_capacity_id}/{end_url}/content"
 
     # Get source capacity spark settings
-    response = client.get(get_url)
-    if response.status_code != 200:
-        raise FabricHTTPException(response)
-
+    response = _base_api(request=get_url)
     payload = response.json().get("content")
 
     # Update target capacity spark settings
-    response_put = client.put(put_url, json=payload)
-
-    if response_put.status_code != 200:
-        raise FabricHTTPException(response_put)
+    _base_api(request=put_url, method="put", payload=payload)
     print(
         f"{icons.green_dot} The spark settings have been migrated from the '{source_capacity}' capacity to the '{target_capacity}' capacity."
     )
@@ -624,15 +575,12 @@ def migrate_spark_settings(source_capacity: str, target_capacity: str):
 @log
 def migrate_fabric_trial_capacity(
     azure_subscription_id: str,
-    key_vault_uri: str,
-    key_vault_tenant_id: str,
-    key_vault_client_id: str,
-    key_vault_client_secret: str,
     resource_group: str,
     source_capacity: str,
     target_capacity: str,
     target_capacity_sku: str = "F64",
     target_capacity_admin_members: Optional[str | List[str]] = None,
+    **kwargs,
 ):
     """
     This function migrates a Fabric trial capacity to a Fabric capacity. If the 'target_capacity' does not exist, it is created with the relevant target capacity parameters (sku, region, admin members).
@@ -641,14 +589,6 @@ def migrate_fabric_trial_capacity(
     ----------
     azure_subscription_id : str
         The Azure subscription ID.
-    key_vault_uri : str
-        The name of the `Azure key vault <https://azure.microsoft.com/products/key-vault>`_ URI. Example: "https://<Key Vault Name>.vault.azure.net/"
-    key_vault_tenant_id : str
-        The name of the Azure key vault secret storing the Tenant ID.
-    key_vault_client_id : str
-        The name of the Azure key vault secret storing the Client ID.
-    key_vault_client_secret : str
-        The name of the Azure key vault secret storing the Client Secret.
     resource_group : str
         The name of the Azure resource group.
     source_capacity : str
@@ -669,7 +609,7 @@ def migrate_fabric_trial_capacity(
     dfC = list_capacities()
     dfC_filt = dfC[dfC["Capacity Name"] == source_capacity]
 
-    if len(dfC_filt) == 0:
+    if dfC_filt.empty:
         raise ValueError(
             f"{icons.red_dot} The {source_capacity}' capacity does not exist."
         )
@@ -701,10 +641,6 @@ def migrate_fabric_trial_capacity(
         create_fabric_capacity(
             capacity_name=target_capacity,
             azure_subscription_id=azure_subscription_id,
-            key_vault_uri=key_vault_uri,
-            key_vault_tenant_id=key_vault_tenant_id,
-            key_vault_client_id=key_vault_client_id,
-            key_vault_client_secret=key_vault_client_secret,
             resource_group=resource_group,
             region=target_capacity_region,
             admin_members=target_capacity_admin_members,
@@ -718,7 +654,7 @@ def migrate_fabric_trial_capacity(
     )
 
     # This migrates all the capacity settings
-    migrate_settings(
-        source_capacity=source_capacity,
-        target_capacity=target_capacity,
-    )
+    # _migrate_settings(
+    #    source_capacity=source_capacity,
+    #    target_capacity=target_capacity,
+    # )

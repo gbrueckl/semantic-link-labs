@@ -1,14 +1,12 @@
-import sempy.fabric as fabric
 import pandas as pd
-import sempy_labs._icons as icons
 from typing import Optional
-from sempy_labs._helper_functions import (
-    resolve_workspace_name_and_id,
-)
-from sempy.fabric.exceptions import FabricHTTPException
+from uuid import UUID
+from sempy._utils._log import log
+import sempy_labs.spark as sp
 
 
-def list_custom_pools(workspace: Optional[str] = None) -> pd.DataFrame:
+@log
+def list_custom_pools(workspace: Optional[str | UUID] = None) -> pd.DataFrame:
     """
     Lists all `custom pools <https://learn.microsoft.com/fabric/data-engineering/create-custom-spark-pools>`_ within a workspace.
 
@@ -16,7 +14,7 @@ def list_custom_pools(workspace: Optional[str] = None) -> pd.DataFrame:
 
     Parameters
     ----------
-    workspace : str, default=None
+    workspace : str | uuid.UUID, default=None
         The name of the Fabric workspace.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
@@ -27,64 +25,10 @@ def list_custom_pools(workspace: Optional[str] = None) -> pd.DataFrame:
         A pandas dataframe showing all the custom pools within the Fabric workspace.
     """
 
-    (workspace, workspace_id) = resolve_workspace_name_and_id(workspace)
-
-    df = pd.DataFrame(
-        columns=[
-            "Custom Pool ID",
-            "Custom Pool Name",
-            "Type",
-            "Node Family",
-            "Node Size",
-            "Auto Scale Enabled",
-            "Auto Scale Min Node Count",
-            "Auto Scale Max Node Count",
-            "Dynamic Executor Allocation Enabled",
-            "Dynamic Executor Allocation Min Executors",
-            "Dynamic Executor Allocation Max Executors",
-        ]
-    )
-
-    client = fabric.FabricRestClient()
-    response = client.get(f"/v1/workspaces/{workspace_id}/spark/pools")
-    if response.status_code != 200:
-        raise FabricHTTPException(response)
-
-    for i in response.json()["value"]:
-
-        aScale = i.get("autoScale", {})
-        d = i.get("dynamicExecutorAllocation", {})
-
-        new_data = {
-            "Custom Pool ID": i.get("id"),
-            "Custom Pool Name": i.get("name"),
-            "Type": i.get("type"),
-            "Node Family": i.get("nodeFamily"),
-            "Node Size": i.get("nodeSize"),
-            "Auto Scale Enabled": aScale.get("enabled"),
-            "Auto Scale Min Node Count": aScale.get("minNodeCount"),
-            "Auto Scale Max Node Count": aScale.get("maxNodeCount"),
-            "Dynamic Executor Allocation Enabled": d.get("enabled"),
-            "Dynamic Executor Allocation Min Executors": d.get("minExecutors"),
-            "Dynamic Executor Allocation Max Executors": d.get("maxExecutors"),
-        }
-        df = pd.concat([df, pd.DataFrame(new_data, index=[0])], ignore_index=True)
-
-    bool_cols = ["Auto Scale Enabled", "Dynamic Executor Allocation Enabled"]
-    int_cols = [
-        "Auto Scale Min Node Count",
-        "Auto Scale Max Node Count",
-        "Dynamic Executor Allocation Enabled",
-        "Dynamic Executor Allocation Min Executors",
-        "Dynamic Executor Allocation Max Executors",
-    ]
-
-    df[bool_cols] = df[bool_cols].astype(bool)
-    df[int_cols] = df[int_cols].astype(int)
-
-    return df
+    return sp.list_custom_pools(workspace=workspace)
 
 
+@log
 def create_custom_pool(
     pool_name: str,
     node_size: str,
@@ -95,7 +39,7 @@ def create_custom_pool(
     node_family: str = "MemoryOptimized",
     auto_scale_enabled: bool = True,
     dynamic_executor_allocation_enabled: bool = True,
-    workspace: Optional[str] = None,
+    workspace: Optional[str | UUID] = None,
 ):
     """
     Creates a `custom pool <https://learn.microsoft.com/fabric/data-engineering/create-custom-spark-pools>`_ within a workspace.
@@ -122,42 +66,27 @@ def create_custom_pool(
         The status of `auto scale <https://learn.microsoft.com/rest/api/fabric/spark/custom-pools/create-workspace-custom-pool?tabs=HTTP#autoscaleproperties>`_.
     dynamic_executor_allocation_enabled : bool, default=True
         The status of the `dynamic executor allocation <https://learn.microsoft.com/en-us/rest/api/fabric/spark/custom-pools/create-workspace-custom-pool?tabs=HTTP#dynamicexecutorallocationproperties>`_.
-    workspace : str, default=None
-        The name of the Fabric workspace.
+    workspace : str | uuid.UUID, default=None
+        The name or ID of the Fabric workspace.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
     """
 
-    (workspace, workspace_id) = resolve_workspace_name_and_id(workspace)
-
-    request_body = {
-        "name": pool_name,
-        "nodeFamily": node_family,
-        "nodeSize": node_size,
-        "autoScale": {
-            "enabled": auto_scale_enabled,
-            "minNodeCount": min_node_count,
-            "maxNodeCount": max_node_count,
-        },
-        "dynamicExecutorAllocation": {
-            "enabled": dynamic_executor_allocation_enabled,
-            "minExecutors": min_executors,
-            "maxExecutors": max_executors,
-        },
-    }
-
-    client = fabric.FabricRestClient()
-    response = client.post(
-        f"/v1/workspaces/{workspace_id}/spark/pools", json=request_body
-    )
-
-    if response.status_code != 201:
-        raise FabricHTTPException(response)
-    print(
-        f"{icons.green_dot} The '{pool_name}' spark pool has been created within the '{workspace}' workspace."
+    sp.create_custom_pool(
+        pool_name=pool_name,
+        node_size=node_size,
+        min_node_count=min_node_count,
+        max_node_count=max_node_count,
+        min_executors=min_executors,
+        max_executors=max_executors,
+        node_family=node_family,
+        auto_scale_enabled=auto_scale_enabled,
+        dynamic_executor_allocation_enabled=dynamic_executor_allocation_enabled,
+        workspace=workspace,
     )
 
 
+@log
 def update_custom_pool(
     pool_name: str,
     node_size: Optional[str] = None,
@@ -168,7 +97,7 @@ def update_custom_pool(
     node_family: Optional[str] = None,
     auto_scale_enabled: Optional[bool] = None,
     dynamic_executor_allocation_enabled: Optional[bool] = None,
-    workspace: Optional[str] = None,
+    workspace: Optional[str | UUID] = None,
 ):
     """
     Updates the properties of a `custom pool <https://learn.microsoft.com/fabric/data-engineering/create-custom-spark-pools>`_ within a workspace.
@@ -203,70 +132,28 @@ def update_custom_pool(
     dynamic_executor_allocation_enabled : bool, default=None
         The status of the `dynamic executor allocation <https://learn.microsoft.com/en-us/rest/api/fabric/spark/custom-pools/create-workspace-custom-pool?tabs=HTTP#dynamicexecutorallocationproperties>`_.
         Defaults to None which keeps the existing property setting.
-    workspace : str, default=None
-        The name of the Fabric workspace.
+    workspace : str | uuid.UUID, default=None
+        The name or ID of the Fabric workspace.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
     """
 
-    (workspace, workspace_id) = resolve_workspace_name_and_id(workspace)
-
-    df = list_custom_pools(workspace=workspace)
-    df_pool = df[df["Custom Pool Name"] == pool_name]
-
-    if len(df_pool) == 0:
-        raise ValueError(
-            f"{icons.red_dot} The '{pool_name}' custom pool does not exist within the '{workspace}'. Please choose a valid custom pool."
-        )
-
-    if node_family is None:
-        node_family = df_pool["Node Family"].iloc[0]
-    if node_size is None:
-        node_size = df_pool["Node Size"].iloc[0]
-    if auto_scale_enabled is None:
-        auto_scale_enabled = bool(df_pool["Auto Scale Enabled"].iloc[0])
-    if min_node_count is None:
-        min_node_count = int(df_pool["Min Node Count"].iloc[0])
-    if max_node_count is None:
-        max_node_count = int(df_pool["Max Node Count"].iloc[0])
-    if dynamic_executor_allocation_enabled is None:
-        dynamic_executor_allocation_enabled = bool(
-            df_pool["Dynami Executor Allocation Enabled"].iloc[0]
-        )
-    if min_executors is None:
-        min_executors = int(df_pool["Min Executors"].iloc[0])
-    if max_executors is None:
-        max_executors = int(df_pool["Max Executors"].iloc[0])
-
-    request_body = {
-        "name": pool_name,
-        "nodeFamily": node_family,
-        "nodeSize": node_size,
-        "autoScale": {
-            "enabled": auto_scale_enabled,
-            "minNodeCount": min_node_count,
-            "maxNodeCount": max_node_count,
-        },
-        "dynamicExecutorAllocation": {
-            "enabled": dynamic_executor_allocation_enabled,
-            "minExecutors": min_executors,
-            "maxExecutors": max_executors,
-        },
-    }
-
-    client = fabric.FabricRestClient()
-    response = client.post(
-        f"/v1/workspaces/{workspace_id}/spark/pools", json=request_body
-    )
-
-    if response.status_code != 200:
-        raise FabricHTTPException(response)
-    print(
-        f"{icons.green_dot} The '{pool_name}' spark pool within the '{workspace}' workspace has been updated."
+    sp.update_custom_pool(
+        pool_name=pool_name,
+        node_size=node_size,
+        min_node_count=min_node_count,
+        max_node_count=max_node_count,
+        min_executors=min_executors,
+        max_executors=max_executors,
+        node_family=node_family,
+        auto_scale_enabled=auto_scale_enabled,
+        dynamic_executor_allocation_enabled=dynamic_executor_allocation_enabled,
+        workspace=workspace,
     )
 
 
-def delete_custom_pool(pool_name: str, workspace: Optional[str] = None):
+@log
+def delete_custom_pool(pool_name: str, workspace: Optional[str | UUID] = None):
     """
     Deletes a `custom pool <https://learn.microsoft.com/fabric/data-engineering/create-custom-spark-pools>`_ within a workspace.
 
@@ -276,35 +163,18 @@ def delete_custom_pool(pool_name: str, workspace: Optional[str] = None):
     ----------
     pool_name : str
         The custom pool name.
-    workspace : str, default=None
-        The name of the Fabric workspace.
+    workspace : str | uuid.UUID, default=None
+        The name or ID of the Fabric workspace.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
     """
 
-    (workspace, workspace_id) = resolve_workspace_name_and_id(workspace)
-
-    dfL = list_custom_pools(workspace=workspace)
-    dfL_filt = dfL[dfL["Custom Pool Name"] == pool_name]
-
-    if len(dfL_filt) == 0:
-        raise ValueError(
-            f"{icons.red_dot} The '{pool_name}' custom pool does not exist within the '{workspace}' workspace."
-        )
-    poolId = dfL_filt["Custom Pool ID"].iloc[0]
-
-    client = fabric.FabricRestClient()
-    response = client.delete(f"/v1/workspaces/{workspace_id}/spark/pools/{poolId}")
-
-    if response.status_code != 200:
-        raise FabricHTTPException(response)
-    print(
-        f"{icons.green_dot} The '{pool_name}' spark pool has been deleted from the '{workspace}' workspace."
-    )
+    sp.delete_custom_pool(pool_name=pool_name, workspace=workspace)
 
 
+@log
 def get_spark_settings(
-    workspace: Optional[str] = None, return_dataframe: bool = True
+    workspace: Optional[str | UUID] = None, return_dataframe: bool = True
 ) -> pd.DataFrame | dict:
     """
     Shows the spark settings for a workspace.
@@ -313,8 +183,8 @@ def get_spark_settings(
 
     Parameters
     ----------
-    workspace : str, default=None
-        The name of the Fabric workspace.
+    workspace : str | uuid.UUID, default=None
+        The name or ID of the Fabric workspace.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
     return_dataframe : bool, default=True
@@ -326,64 +196,10 @@ def get_spark_settings(
         A pandas dataframe showing the spark settings for a workspace.
     """
 
-    (workspace, workspace_id) = resolve_workspace_name_and_id(workspace)
-
-    df = pd.DataFrame(
-        columns=[
-            "Automatic Log Enabled",
-            "High Concurrency Enabled",
-            "Customize Compute Enabled",
-            "Default Pool Name",
-            "Default Pool Type",
-            "Max Node Count",
-            "Max Executors",
-            "Environment Name",
-            "Runtime Version",
-        ]
-    )
-
-    client = fabric.FabricRestClient()
-    response = client.get(f"/v1/workspaces/{workspace_id}/spark/settings")
-    if response.status_code != 200:
-        raise FabricHTTPException(response)
-
-    i = response.json()
-    p = i.get("pool")
-    dp = i.get("pool", {}).get("defaultPool", {})
-    sp = i.get("pool", {}).get("starterPool", {})
-    e = i.get("environment", {})
-
-    new_data = {
-        "Automatic Log Enabled": i.get("automaticLog").get("enabled"),
-        "High Concurrency Enabled": i.get("highConcurrency").get(
-            "notebookInteractiveRunEnabled"
-        ),
-        "Customize Compute Enabled": p.get("customizeComputeEnabled"),
-        "Default Pool Name": dp.get("name"),
-        "Default Pool Type": dp.get("type"),
-        "Max Node Count": sp.get("maxNodeCount"),
-        "Max Node Executors": sp.get("maxExecutors"),
-        "Environment Name": e.get("name"),
-        "Runtime Version": e.get("runtimeVersion"),
-    }
-    df = pd.concat([df, pd.DataFrame(new_data, index=[0])], ignore_index=True)
-
-    bool_cols = [
-        "Automatic Log Enabled",
-        "High Concurrency Enabled",
-        "Customize Compute Enabled",
-    ]
-    # int_cols = ["Max Node Count", "Max Executors"]
-
-    df[bool_cols] = df[bool_cols].astype(bool)
-    # df[int_cols] = df[int_cols].astype(int)
-
-    if return_dataframe:
-        return df
-    else:
-        return response.json()
+    return sp.get_spark_settings(workspace=workspace, return_dataframe=return_dataframe)
 
 
+@log
 def update_spark_settings(
     automatic_log_enabled: Optional[bool] = None,
     high_concurrency_enabled: Optional[bool] = None,
@@ -393,7 +209,7 @@ def update_spark_settings(
     max_executors: Optional[int] = None,
     environment_name: Optional[str] = None,
     runtime_version: Optional[str] = None,
-    workspace: Optional[str] = None,
+    workspace: Optional[str | UUID] = None,
 ):
     """
     Updates the spark settings for a workspace.
@@ -426,42 +242,20 @@ def update_spark_settings(
     runtime_version : str, default=None
         The `runtime version <https://learn.microsoft.com/rest/api/fabric/spark/workspace-settings/update-spark-settings?tabs=HTTP#environmentproperties>`_.
         Defaults to None which keeps the existing property setting.
-    workspace : str, default=None
-        The name of the Fabric workspace.
+    workspace : str | uuid.UUID, default=None
+        The name or ID of the Fabric workspace.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
     """
 
-    (workspace, workspace_id) = resolve_workspace_name_and_id(workspace)
-
-    request_body = get_spark_settings(workspace=workspace, return_dataframe=False)
-
-    if automatic_log_enabled is not None:
-        request_body["automaticLog"]["enabled"] = automatic_log_enabled
-    if high_concurrency_enabled is not None:
-        request_body["highConcurrency"][
-            "notebookInteractiveRunEnabled"
-        ] = high_concurrency_enabled
-    if customize_compute_enabled is not None:
-        request_body["pool"]["customizeComputeEnabled"] = customize_compute_enabled
-    if default_pool_name is not None:
-        request_body["pool"]["defaultPool"]["name"] = default_pool_name
-    if max_node_count is not None:
-        request_body["pool"]["starterPool"]["maxNodeCount"] = max_node_count
-    if max_executors is not None:
-        request_body["pool"]["starterPool"]["maxExecutors"] = max_executors
-    if environment_name is not None:
-        request_body["environment"]["name"] = environment_name
-    if runtime_version is not None:
-        request_body["environment"]["runtimeVersion"] = runtime_version
-
-    client = fabric.FabricRestClient()
-    response = client.patch(
-        f"/v1/workspaces/{workspace_id}/spark/settings", json=request_body
-    )
-
-    if response.status_code != 200:
-        raise FabricHTTPException(response)
-    print(
-        f"{icons.green_dot} The spark settings within the '{workspace}' workspace have been updated accordingly."
+    sp.update_spark_settings(
+        automatic_log_enabled=automatic_log_enabled,
+        high_concurrency_enabled=high_concurrency_enabled,
+        customize_compute_enabled=customize_compute_enabled,
+        default_pool_name=default_pool_name,
+        max_node_count=max_node_count,
+        max_executors=max_executors,
+        environment_name=environment_name,
+        runtime_version=runtime_version,
+        workspace=workspace,
     )

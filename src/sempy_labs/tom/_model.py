@@ -2,21 +2,34 @@ import sempy
 import sempy.fabric as fabric
 import pandas as pd
 import re
+import os
+import json
 from datetime import datetime
+from decimal import Decimal
 from sempy_labs._helper_functions import (
+    _base_api,
     format_dax_object_name,
     generate_guid,
     _make_list_unique,
+    resolve_dataset_name_and_id,
+    resolve_workspace_name_and_id,
+    resolve_workspace_id,
+    resolve_item_id,
+    resolve_lakehouse_id,
+    _validate_weight,
 )
 from sempy_labs._list_functions import list_relationships
 from sempy_labs._refresh_semantic_model import refresh_semantic_model
 from sempy_labs.directlake._dl_helper import check_fallback_reason
 from contextlib import contextmanager
-from typing import List, Iterator, Optional, Union, TYPE_CHECKING
+from typing import List, Iterator, Optional, Union, TYPE_CHECKING, Literal
 from sempy._utils._log import log
 import sempy_labs._icons as icons
-from sempy.fabric.exceptions import FabricHTTPException
 import ast
+from uuid import UUID
+import sempy_labs._authentication as auth
+from sempy_labs.lakehouse._lakehouse import lakehouse_attached
+
 
 if TYPE_CHECKING:
     import Microsoft.AnalysisServices.Tabular
@@ -27,31 +40,121 @@ class TOMWrapper:
     """
     Convenience wrapper around the TOM object model for a semantic model. Always use the connect_semantic_model function to make sure the TOM object is initialized correctly.
 
-    `XMLA read/write endpoints <https://learn.microsoft.com/power-bi/enterprise/service-premium-connect-tools#to-enable-read-write-for-a-premium-capacity>`_ must
-     be enabled if setting the readonly parameter to False.
+    `XMLA read/write endpoints <https://learn.microsoft.com/power-bi/enterprise/service-premium-connect-tools#to-enable-read-write-for-a-premium-capacity>`_ must be enabled if setting the readonly parameter to False.
     """
 
-    _dataset: str
-    _workspace: str
+    _dataset_id: UUID
+    _dataset_name: str
+    _workspace_id: UUID
+    _workspace_name: str
     _readonly: bool
     _tables_added: List[str]
     _table_map = dict
     _column_map = dict
+    _dax_formatting = {
+        "measures": [],
+        "calculated_columns": [],
+        "calculated_tables": [],
+        "calculation_items": [],
+        "rls": [],
+    }
 
     def __init__(self, dataset, workspace, readonly):
-        self._dataset = dataset
-        self._workspace = workspace
+
+        self._is_azure_as = False
+        prefix = "asazure"
+        prefix_full = f"{prefix}://"
+        read_write = ":rw"
+        self._token_provider = auth.token_provider.get()
+
+        # Azure AS workspace logic
+        if workspace is not None and workspace.startswith(prefix_full):
+            # Set read or read/write accordingly
+            if readonly is False and not workspace.endswith(read_write):
+                workspace += read_write
+            elif readonly is True and workspace.endswith(read_write):
+                workspace = workspace[: -len(read_write)]
+            self._workspace_name = workspace
+            self._workspace_id = workspace
+            self._dataset_id = dataset
+            self._dataset_name = dataset
+            self._is_azure_as = True
+            if self._token_provider is None:
+                raise ValueError(
+                    f"{icons.red_dot} A token provider must be provided when connecting to an Azure AS workspace."
+                )
+        else:
+            (workspace_name, workspace_id) = resolve_workspace_name_and_id(workspace)
+            (dataset_name, dataset_id) = resolve_dataset_name_and_id(
+                dataset, workspace_id
+            )
+            self._dataset_id = dataset_id
+            self._dataset_name = dataset_name
+            self._workspace_name = workspace_name
+            self._workspace_id = workspace_id
         self._readonly = readonly
         self._tables_added = []
 
-        self._tom_server = fabric.create_tom_server(
-            readonly=readonly, workspace=workspace
-        )
-        self.model = self._tom_server.Databases.GetByName(dataset).Model
+        # No token provider (standard authentication)
+        if self._token_provider is None:
+            self._tom_server = fabric.create_tom_server(
+                dataset=dataset, readonly=readonly, workspace=workspace_id
+            )
+        # Service Principal Authentication for Azure AS via token provider
+        elif self._is_azure_as:
+            import Microsoft.AnalysisServices.Tabular as TOM
+
+            # Extract region from the workspace
+            match = re.search(rf"{prefix_full}(.*?).{prefix}", self._workspace_name)
+            if match:
+                region = match.group(1)
+            if self._token_provider is None:
+                raise ValueError(
+                    f"{icons.red_dot} A token provider must be provided when connecting to Azure Analysis Services."
+                )
+            token = self._token_provider(audience="asazure", region=region)
+            connection_str = f'Provider=MSOLAP;Data Source={self._workspace_name};Password="{token}";Persist Security Info=True;Impersonation Level=Impersonate'
+            self._tom_server = TOM.Server()
+            self._tom_server.Connect(connection_str)
+        # Service Principal Authentication for Power BI via token provider
+        else:
+            from functools import partial
+            from sempy.fabric._client._utils import _build_adomd_connection_string
+            import Microsoft.AnalysisServices.Tabular as TOM
+            from Microsoft.AnalysisServices import AccessToken
+            from sempy.fabric._client._utils import refresh_tom_access_token
+            from sempy.fabric._credentials import ConstantTokenCredential
+            from System import Func
+
+            token = self._token_provider(audience="pbi")
+
+            self._tom_server = TOM.Server()
+            get_access_token = partial(
+                refresh_tom_access_token, credential=ConstantTokenCredential(token)
+            )
+            self._tom_server.AccessToken = get_access_token(None)
+            self._tom_server.OnAccessTokenExpired = Func[AccessToken, AccessToken](
+                get_access_token
+            )
+            workspace_url = f"powerbi://api.powerbi.com/v1.0/myorg/{workspace}"
+            connection_str = _build_adomd_connection_string(
+                workspace_url, readonly=readonly
+            )
+            self._tom_server.Connect(connection_str)
+
+        if self._is_azure_as:
+            self.model = self._tom_server.Databases.GetByName(self._dataset_name).Model
+        else:
+            self.model = self._tom_server.Databases[dataset_id].Model
 
         self._table_map = {}
         self._column_map = {}
-        self._compat_level = self.model.Model.Database.CompatibilityLevel
+        self._compat_level = self.model.Database.CompatibilityLevel
+
+        # Max compat level
+        s = self.model.Server.SupportedCompatibilityLevels
+        nums = [int(x) for x in s.split(",") if x.strip() != "1000000"]
+        self._max_compat_level = max(nums)
 
         # Minimum campat level for lineage tags is 1540 (https://learn.microsoft.com/dotnet/api/microsoft.analysisservices.tabular.table.lineagetag?view=analysisservices-dotnet#microsoft-analysisservices-tabular-table-lineagetag)
         if self._compat_level >= 1540:
@@ -139,6 +242,22 @@ class TOMWrapper:
         for t in self.model.Tables:
             if t.CalculationGroup is not None:
                 yield t
+
+    def all_functions(self):
+        """
+        Outputs a list of all user-defined functions in the semantic model.
+
+        Parameters
+        ----------
+
+        Returns
+        -------
+        Iterator[Microsoft.AnalysisServices.Tabular.Function]
+            All user-defined functions within the semantic model.
+        """
+
+        for f in self.model.Functions:
+            yield f
 
     def all_measures(self):
         """
@@ -659,6 +778,71 @@ class TOMWrapper:
             obj.Description = description
         self.model.Roles.Add(obj)
 
+    def set_compatibility_level(self, compatibility_level: int):
+        """
+        Sets compatibility level of the semantic model
+
+        Parameters
+        ----------
+        compatibility_level : int
+            The compatibility level to set the for the semantic model.
+        """
+        import Microsoft.AnalysisServices.Tabular as TOM
+
+        if compatibility_level < 1500 or compatibility_level > self._max_compat_level:
+            raise ValueError(
+                f"{icons.red_dot} Compatibility level must be between 1500 and {self._max_compat_level}."
+            )
+        if self._compat_level > compatibility_level:
+            print(
+                f"{icons.warning} Compatibility level can only be increased, not decreased."
+            )
+            return
+
+        self.model.Database.CompatibilityLevel = compatibility_level
+        bim = TOM.JsonScripter.ScriptCreateOrReplace(self.model.Database)
+        fabric.execute_tmsl(script=bim, workspace=self._workspace_id)
+
+    def delete_user_defined_function(self, name: str):
+
+        try:
+            object = self.model.Functions[name]
+            object.Parent.Functions.Remove(object.Name)
+        except Exception:
+            pass
+        #    print(f"{icons.info} The user-defined function '{name}' does not exist within the semantic model.")
+
+    def set_user_defined_function(self, name: str, expression: str):
+        """
+        Sets the definition of a `user-defined <https://learn.microsoft.com/en-us/dax/best-practices/dax-user-defined-functions#using-model-explorer>`_ function within the semantic model. This function requires that the compatibility level is at least 1702.
+
+        Parameters
+        ----------
+        name : str
+            Name of the user-defined function.
+        expression : str
+            The DAX expression for the user-defined function.
+        """
+        import Microsoft.AnalysisServices.Tabular as TOM
+
+        if self._compat_level < 1702:
+            raise ValueError(
+                f"{icons.warning} User-defined functions require a compatibility level of at least 1702. The current compatibility level is {self._compat_level}. Use the 'tom.set_compatibility_level' function to change the compatibility level. See the example below:\n"
+                f"with connect_semantic_model(dataset='{self._dataset_name}', workspace='{self._workspace_name}', readonly=False):"
+                f"    tom.set_compatibility_level(compatibility_level=1702)"
+            )
+
+        existing = [f.Name for f in self.model.Functions]
+
+        if name in existing:
+            self.model.Functions[name].Expression = expression
+        else:
+            obj = TOM.Function()
+            obj.Name = name
+            obj.Expression = expression
+            obj.LineageTag = generate_guid()
+            self.model.Functions.Add(obj)
+
     def set_rls(self, role_name: str, table_name: str, filter_expression: str):
         """
         Sets the row level security permissions for a table within a role.
@@ -690,7 +874,11 @@ class TOMWrapper:
             self.model.Roles[role_name].TablePermissions.Add(tp)
 
     def set_ols(
-        self, role_name: str, table_name: str, column_name: str, permission: str
+        self,
+        role_name: str,
+        table_name: str,
+        column_name: Optional[str] = None,
+        permission: Literal["Default", "None", "Read"] = "Default",
     ):
         """
         Sets the object level security permissions for a column within a role.
@@ -701,9 +889,9 @@ class TOMWrapper:
             Name of the role.
         table_name : str
             Name of the table.
-        column_name : str
-            Name of the column.
-        permission : str
+        column_name : str, default=None
+            Name of the column. Defaults to None which sets object level security for the entire table.
+        permission : typing.Literal["Default", "None", "Read"], default="Default"
             The object level security permission for the column.
             `Permission valid values <https://learn.microsoft.com/dotnet/api/microsoft.analysisservices.tabular.metadatapermission?view=analysisservices-dotnet>`_
         """
@@ -715,23 +903,37 @@ class TOMWrapper:
         if permission not in ["Read", "None", "Default"]:
             raise ValueError(f"{icons.red_dot} Invalid 'permission' value.")
 
-        cp = TOM.ColumnPermission()
-        cp.Column = self.model.Tables[table_name].Columns[column_name]
-        cp.MetadataPermission = System.Enum.Parse(TOM.MetadataPermission, permission)
+        r = self.model.Roles[role_name]
+        tables = [t.Name for t in r.TablePermissions]
+        # Add table permission if it does not exist
+        if table_name not in tables:
+            tp = TOM.TablePermission()
+            tp.Table = self.model.Tables[table_name]
+            r.TablePermissions.Add(tp)
+        columns = [c.Name for c in r.TablePermissions[table_name].ColumnPermissions]
 
-        if any(
-            c.Name == column_name and t.Name == table_name and r.Name == role_name
-            for r in self.model.Roles
-            for t in r.TablePermissions
-            for c in t.ColumnPermissions
-        ):
-            self.model.Roles[role_name].TablePermissions[table_name].ColumnPermissions[
-                column_name
-            ].MetadataPermission = System.Enum.Parse(TOM.MetadataPermission, permission)
+        # Set column level security if column is specified
+        if column_name:
+            # Add column permission if it does not exist
+            if column_name not in columns:
+                cp = TOM.ColumnPermission()
+                cp.Column = self.model.Tables[table_name].Columns[column_name]
+                cp.MetadataPermission = System.Enum.Parse(
+                    TOM.MetadataPermission, permission
+                )
+                r.TablePermissions[table_name].ColumnPermissions.Add(cp)
+            # Set column permission if it already exists
+            else:
+                r.TablePermissions[table_name].ColumnPermissions[
+                    column_name
+                ].MetadataPermission = System.Enum.Parse(
+                    TOM.MetadataPermission, permission
+                )
+        # Set table level security if column is not specified
         else:
-            self.model.Roles[role_name].TablePermissions[
-                table_name
-            ].ColumnPermissions.Add(cp)
+            r.TablePermissions[table_name].MetadataPermission = System.Enum.Parse(
+                TOM.MetadataPermission, permission
+            )
 
     def add_hierarchy(
         self,
@@ -851,19 +1053,23 @@ class TOMWrapper:
         import Microsoft.AnalysisServices.Tabular as TOM
         import System
 
-        if cross_filtering_behavior is None:
+        if not cross_filtering_behavior:
             cross_filtering_behavior = "Automatic"
-        if security_filtering_behavior is None:
+        if not security_filtering_behavior:
             security_filtering_behavior = "OneDirection"
 
-        from_cardinality = from_cardinality.capitalize()
-        to_cardinality = to_cardinality.capitalize()
-        cross_filtering_behavior = cross_filtering_behavior.capitalize()
-        security_filtering_behavior = security_filtering_behavior.capitalize()
+        for var_name in [
+            "from_cardinality",
+            "to_cardinality",
+            "cross_filtering_behavior",
+            "security_filtering_behavior",
+        ]:
+            locals()[var_name] = locals()[var_name].capitalize()
+
+        cross_filtering_behavior = cross_filtering_behavior.replace("direct", "Direct")
         security_filtering_behavior = security_filtering_behavior.replace(
             "direct", "Direct"
         )
-        cross_filtering_behavior = cross_filtering_behavior.replace("direct", "Direct")
 
         rel = TOM.SingleColumnRelationship()
         rel.FromColumn = self.model.Tables[from_table].Columns[from_column]
@@ -875,13 +1081,16 @@ class TOMWrapper:
             TOM.RelationshipEndCardinality, to_cardinality
         )
         rel.IsActive = is_active
-        rel.CrossFilteringBehavior = System.Enum.Parse(
-            TOM.CrossFilteringBehavior, cross_filtering_behavior
-        )
-        rel.SecurityFilteringBehavior = System.Enum.Parse(
-            TOM.SecurityFilteringBehavior, security_filtering_behavior
-        )
-        rel.RelyOnReferentialIntegrity = rely_on_referential_integrity
+        if cross_filtering_behavior != "Automatic":
+            rel.CrossFilteringBehavior = System.Enum.Parse(
+                TOM.CrossFilteringBehavior, cross_filtering_behavior
+            )
+        if security_filtering_behavior != "OneDirection":
+            rel.SecurityFilteringBehavior = System.Enum.Parse(
+                TOM.SecurityFilteringBehavior, security_filtering_behavior
+            )
+        if rely_on_referential_integrity:
+            rel.RelyOnReferentialIntegrity = True
 
         self.model.Relationships.Add(rel)
 
@@ -1077,7 +1286,7 @@ class TOMWrapper:
         entity_name: str,
         expression: Optional[str] = None,
         description: Optional[str] = None,
-        schema_name: str = "dbo",
+        schema_name: str = None,
     ):
         """
         Adds an entity partition to a table within a semantic model.
@@ -1088,12 +1297,12 @@ class TOMWrapper:
             Name of the table.
         entity_name : str
             Name of the lakehouse/warehouse table.
-        expression : TOM Object, default=None
-            The expression used by the table.
+        expression : str, default=None
+            The name of the expression used by the partition.
             Defaults to None which resolves to the 'DatabaseQuery' expression.
         description : str, default=None
             A description for the partition.
-        schema_name : str, default="dbo"
+        schema_name : str, default=None
             The schema name.
         """
         import Microsoft.AnalysisServices.Tabular as TOM
@@ -1105,13 +1314,18 @@ class TOMWrapper:
             ep.ExpressionSource = self.model.Expressions["DatabaseQuery"]
         else:
             ep.ExpressionSource = self.model.Expressions[expression]
-        ep.SchemaName = schema_name
+        if schema_name:
+            ep.SchemaName = schema_name
         p = TOM.Partition()
         p.Name = table_name
         p.Source = ep
         p.Mode = TOM.ModeType.DirectLake
         if description is not None:
             p.Description = description
+
+        # For the source lineage tag
+        if schema_name is None:
+            schema_name = "dbo"
 
         self.model.Tables[table_name].Partitions.Add(p)
         self.model.Tables[table_name].SourceLineageTag = (
@@ -1459,6 +1673,7 @@ class TOMWrapper:
         self,
         object: Union["TOM.Table", "TOM.Column", "TOM.Measure", "TOM.Hierarchy"],
         perspective_name: str,
+        include_all: bool = True,
     ):
         """
         Adds an object to a `perspective <https://learn.microsoft.com/dotnet/api/microsoft.analysisservices.perspective?view=analysisservices-dotnet>`_.
@@ -1469,6 +1684,8 @@ class TOMWrapper:
             An object (i.e. table/column/measure) within a semantic model.
         perspective_name : str
             Name of the perspective.
+        include_all : bool, default=True
+            Relevant to tables only, if set to True, includes all columns, measures, and hierarchies within that table in the perspective.
         """
         import Microsoft.AnalysisServices.Tabular as TOM
 
@@ -1494,6 +1711,8 @@ class TOMWrapper:
 
         if objectType == TOM.ObjectType.Table:
             pt = TOM.PerspectiveTable()
+            if include_all:
+                pt.IncludeAll = True
             pt.Table = object
             object.Model.Perspectives[perspective_name].PerspectiveTables.Add(pt)
         elif objectType == TOM.ObjectType.Column:
@@ -1634,7 +1853,7 @@ class TOMWrapper:
         prop = mapping.get(property)
         if prop is None:
             raise ValueError(
-                f"{icons.red_dot} Invalid property value. Please choose from the following: ['Name', 'Description', Display Folder]."
+                f"{icons.red_dot} Invalid property value. Please choose from the following: {list(mapping.keys())}."
             )
 
         if not any(c.Name == language for c in self.model.Cultures):
@@ -1665,6 +1884,7 @@ class TOMWrapper:
             "TOM.Table", "TOM.Column", "TOM.Measure", "TOM.Hierarchy", "TOM.Level"
         ],
         language: str,
+        property: str = "Name",
     ):
         """
         Removes an object's `translation <https://learn.microsoft.com/dotnet/api/microsoft.analysisservices.tabular.culture?view=analysisservices-dotnet>`_ value.
@@ -1675,13 +1895,28 @@ class TOMWrapper:
             An object (i.e. table/column/measure) within a semantic model.
         language : str
             The language code.
+        property : str, default="Name"
+            The property to set. Options: 'Name', 'Description', 'Display Folder'.
         """
         import Microsoft.AnalysisServices.Tabular as TOM
 
-        o = object.Model.Cultures[language].ObjectTranslations[
-            object, TOM.TranslatedProperty.Caption
-        ]
-        object.Model.Cultures[language].ObjectTranslations.Remove(o)
+        if property in ["Caption", "Name"]:
+            prop = TOM.TranslatedProperty.Caption
+        elif property == "Description":
+            prop = TOM.TranslatedProperty.Description
+        else:
+            prop = TOM.TranslatedProperty.DisplayFolder
+
+        if property == "DisplayFolder" and object.ObjectType not in [
+            TOM.ObjectType.Table,
+            TOM.ObjectType.Column,
+            TOM.ObjectType.Measure,
+            TOM.ObjectType.Hierarchy,
+        ]:
+            pass
+        else:
+            o = object.Model.Cultures[language].ObjectTranslations[object, prop]
+            object.Model.Cultures[language].ObjectTranslations.Remove(o)
 
     def remove_object(self, object):
         """
@@ -1696,6 +1931,8 @@ class TOMWrapper:
 
         objType = object.ObjectType
 
+        properties = ["Name", "Description", "DisplayFolder"]
+
         # Have to remove translations and perspectives on the object before removing it.
         if objType in [
             TOM.ObjectType.Table,
@@ -1706,7 +1943,10 @@ class TOMWrapper:
         ]:
             for lang in object.Model.Cultures:
                 try:
-                    self.remove_translation(object=object, language=lang.Name)
+                    for property in properties:
+                        self.remove_translation(
+                            object=object, language=lang.Name, property=property
+                        )
                 except Exception:
                     pass
         if objType in [
@@ -1752,6 +1992,8 @@ class TOMWrapper:
             object.Parent.CalculationItems.Remove(object.Name)
         elif objType == TOM.ObjectType.TablePermission:
             object.Parent.TablePermissions.Remove(object.Name)
+        elif objType == TOM.ObjectType.Function:
+            object.Parent.Functions.Remove(object.Name)
 
     def used_in_relationships(self, object: Union["TOM.Table", "TOM.Column"]):
         """
@@ -2147,7 +2389,7 @@ class TOMWrapper:
 
         if validate:
             dax_query = f"""
-            define measure '{table_name}'[test] = 
+            define measure '{table_name}'[test] =
             var mn = MIN('{table_name}'[{column_name}])
             var ma = MAX('{table_name}'[{column_name}])
             var x = COUNTROWS(DISTINCT('{table_name}'[{column_name}]))
@@ -2160,7 +2402,9 @@ class TOMWrapper:
             )
             """
             df = fabric.evaluate_dax(
-                dataset=self._dataset, workspace=self._workspace, dax_string=dax_query
+                dataset=self._dataset_id,
+                workspace=self._workspace_id,
+                dax_string=dax_query,
             )
             value = df["[1]"].iloc[0]
             if value != "1":
@@ -2424,7 +2668,7 @@ class TOMWrapper:
             )
         except Exception:
             raise ValueError(
-                f"{icons.red_dot} The '{measure_name}' measure does not exist in the '{self._dataset}' semantic model within the '{self._workspace}'."
+                f"{icons.red_dot} The '{measure_name}' measure does not exist in the '{self._dataset_name}' semantic model within the '{self._workspace_name}'."
             )
 
         graphics = [
@@ -2467,7 +2711,7 @@ class TOMWrapper:
                 )
             except Exception:
                 raise ValueError(
-                    f"{icons.red_dot} The '{target}' measure does not exist in the '{self._dataset}' semantic model within the '{self._workspace}'."
+                    f"{icons.red_dot} The '{target}' measure does not exist in the '{self._dataset_name}' semantic model within the '{self._workspace_name}'."
                 )
 
         if measure_target:
@@ -2736,7 +2980,11 @@ class TOMWrapper:
         self.model.Tables.Add(t)
 
     def add_field_parameter(
-        self, table_name: str, objects: List[str], object_names: List[str] = None
+        self,
+        table_name: str,
+        objects: List[str],
+        object_names: List[str] = None,
+        hierarchy_names: List[str] = None,
     ):
         """
         Adds a `field parameter <https://learn.microsoft.com/power-bi/create-reports/power-bi-field-parameters>`_ to the semantic model.
@@ -2745,13 +2993,18 @@ class TOMWrapper:
         ----------
         table_name : str
             Name of the table.
-        objects : List[str]
+        objects : typing.List[str]
             The columns/measures to be included in the field parameter.
             Columns must be specified as such : 'Table Name'[Column Name].
             Measures may be formatted as '[Measure Name]' or 'Measure Name'.
-        object_names : List[str], default=None
+        object_names : typing.List[str], default=None
             The corresponding visible name for the measures/columns in the objects list.
             Defaults to None which shows the measure/column name.
+        hierarchy_names : typing.List[str], default=None
+            The corresponding hierarchy name for the measures/columns in the objects list if they are to be added to a hierarchy.
+             Defaults to None which adds all fields to the same level (i.e. no hierarchy).
+
+            For details see `here <https://www.youtube.com/watch?v=5G_xSJy5muo>`_.
         """
 
         import Microsoft.AnalysisServices.Tabular as TOM
@@ -2771,39 +3024,87 @@ class TOMWrapper:
                 f"{icons.red_dot} If the 'object_names' parameter is specified, it must correspond exactly to the 'objects' parameter."
             )
 
-        expr = ""
-        i = 0
-        for obj in objects:
-            index = objects.index(obj)
-            success = False
-            for m in self.all_measures():
-                obj_name = m.Name
-                if obj == f"[{obj_name}]" or obj == obj_name:
-                    if object_names is not None:
-                        obj_name = object_names[index]
-                    expr = f'{expr}\n\t("{obj_name}", NAMEOF([{m.Name}]), {str(i)}),'
-                    success = True
-            for c in self.all_columns():
-                obj_name = c.Name
-                fullObjName = format_dax_object_name(c.Parent.Name, c.Name)
-                if obj == fullObjName or obj == c.Parent.Name + "[" + c.Name + "]":
-                    if object_names is not None:
-                        obj_name = object_names[index]
-                    expr = f'{expr}\n\t("{obj_name}", NAMEOF({fullObjName}), {str(i)}),'
-                    success = True
-            if not success:
+        if hierarchy_names is not None and len(objects) != len(hierarchy_names):
+            raise ValueError(
+                f"{icons.red_dot} If the 'hierarchy_names' parameter is specified, it must correspond exactly to the 'objects' parameter."
+            )
+
+        # Measures lookup
+        measure_lookup = {}
+        for m in self.all_measures():
+            measure_lookup[m.Name] = m
+            measure_lookup[f"[{m.Name}]"] = m
+
+        # Columns lookup
+        column_lookup = {}
+        for c in self.all_columns():
+            key1 = f"{c.Parent.Name}[{c.Name}]"
+            key2 = format_dax_object_name(c.Parent.Name, c.Name)
+            column_lookup[key1] = c
+            column_lookup[key2] = c
+
+        def resolve_object(o):
+            """
+            Resolves an object string to a Measure or Column.
+            Returns a dict or None.
+            """
+            if o in measure_lookup:
+                m = measure_lookup[o]
+                return {"type": "Measure", "name": m.Name, "table": m.Parent.Name}
+
+            if o in column_lookup:
+                c = column_lookup[o]
+                return {
+                    "type": "Column",
+                    "name": c.Name,
+                    "table": c.Parent.Name,
+                    "full_name": format_dax_object_name(c.Parent.Name, c.Name),
+                }
+
+            return None
+
+        rows = []
+
+        for index, o in enumerate(objects):
+            resolved = resolve_object(o)
+
+            if not resolved:
                 raise ValueError(
-                    f"{icons.red_dot} The '{obj}' object was not found in the '{self._dataset}' semantic model."
+                    f"{icons.red_dot} The '{o} object does not exist in the semantic model."
                 )
+
+            obj_type = resolved["type"]
+            name = resolved["name"]
+
+            display_name = (
+                object_names[index] if index < len(object_names or []) else None
+            )
+            h_name = (
+                hierarchy_names[index] if index < len(hierarchy_names or []) else None
+            )
+
+            obj_name = display_name or name
+
+            if obj_type == "Measure":
+                expr = f'("{obj_name}", NAMEOF([{name}]), {index}'
             else:
-                i += 1
+                full_object_name = resolved["full_name"]
+                expr = f'("{obj_name}", NAMEOF({full_object_name}), {index}'
 
-        expr = "{" + expr.rstrip(",") + "\n}"
+            if h_name:
+                expr += f', "{h_name}"'
 
-        self.add_calculated_table(name=table_name, expression=expr)
+            expr += ")"
 
-        col2 = table_name + " Fields"
-        col3 = table_name + " Order"
+            rows.append(f"\t{expr}")
+
+        calc_table_expr = "{\n" + ",\n".join(rows) + "\n}"
+
+        # Build calc table and columns
+        self.add_calculated_table(name=table_name, expression=calc_table_expr)
+
+        col2 = f"{table_name} Fields"
+        col3 = f"{table_name} Order"
 
         self.add_calculated_table_column(
             table_name=table_name,
@@ -2826,6 +3127,14 @@ class TOMWrapper:
             data_type="Int64",
             hidden=True,
         )
+        if hierarchy_names:
+            self.add_calculated_table_column(
+                table_name=table_name,
+                column_name="Grouping",
+                source_column="[Value4]",
+                data_type="String",
+                hidden=False,
+            )
 
         self.set_extended_property(
             object=self.model.Tables[table_name].Columns[col2],
@@ -2880,37 +3189,39 @@ class TOMWrapper:
 
         from sempy_labs._list_functions import list_tables
 
+        fabric.refresh_tom_cache(workspace=self._workspace_id)
+
         dfT = list_tables(
-            dataset=self._dataset, workspace=self._workspace, extended=True
+            dataset=self._dataset_id, workspace=self._workspace_id, extended=True
         )
         dfC = fabric.list_columns(
-            dataset=self._dataset, workspace=self._workspace, extended=True
+            dataset=self._dataset_id, workspace=self._workspace_id, extended=True
         )
         dfP = fabric.list_partitions(
-            dataset=self._dataset, workspace=self._workspace, extended=True
+            dataset=self._dataset_id, workspace=self._workspace_id, extended=True
         )
         dfH = fabric.list_hierarchies(
-            dataset=self._dataset, workspace=self._workspace, extended=True
+            dataset=self._dataset_id, workspace=self._workspace_id, extended=True
         )
         dfR = list_relationships(
-            dataset=self._dataset, workspace=self._workspace, extended=True
+            dataset=self._dataset_id, workspace=self._workspace_id, extended=True
         )
 
         for t in self.model.Tables:
             dfT_filt = dfT[dfT["Name"] == t.Name]
-            if len(dfT_filt) > 0:
+            if not dfT_filt.empty:
                 row = dfT_filt.iloc[0]
                 rowCount = str(row["Row Count"])
                 totalSize = str(row["Total Size"])
                 self.set_annotation(object=t, name="Vertipaq_RowCount", value=rowCount)
                 self.set_annotation(
-                    object=t, name="Vertipaq_TableSize", value=totalSize
+                    object=t, name="Vertipaq_TotalSize", value=totalSize
                 )
             for c in t.Columns:
                 dfC_filt = dfC[
                     (dfC["Table Name"] == t.Name) & (dfC["Column Name"] == c.Name)
                 ]
-                if len(dfC_filt) > 0:
+                if not dfC_filt.empty:
                     row = dfC_filt.iloc[0]
                     totalSize = str(row["Total Size"])
                     dataSize = str(row["Data Size"])
@@ -2936,7 +3247,7 @@ class TOMWrapper:
                 dfP_filt = dfP[
                     (dfP["Table Name"] == t.Name) & (dfP["Partition Name"] == p.Name)
                 ]
-                if len(dfP_filt) > 0:
+                if not dfP_filt.empty:
                     row = dfP_filt.iloc[0]
                     recordCount = str(row["Record Count"])
                     segmentCount = str(row["Segment Count"])
@@ -2954,14 +3265,14 @@ class TOMWrapper:
                 dfH_filt = dfH[
                     (dfH["Table Name"] == t.Name) & (dfH["Hierarchy Name"] == h.Name)
                 ]
-                if len(dfH_filt) > 0:
+                if not dfH_filt.empty:
                     usedSize = str(dfH_filt["Used Size"].iloc[0])
                     self.set_annotation(
                         object=h, name="Vertipaq_UsedSize", value=usedSize
                     )
         for r in self.model.Relationships:
             dfR_filt = dfR[dfR["Relationship Name"] == r.Name]
-            if len(dfR_filt) > 0:
+            if not dfR_filt.empty:
                 relSize = str(dfR_filt["Used Size"].iloc[0])
                 self.set_annotation(object=r, name="Vertipaq_UsedSize", value=relSize)
         try:
@@ -3114,12 +3425,12 @@ class TOMWrapper:
         """
         import Microsoft.AnalysisServices.Tabular as TOM
 
-        objType = object.ObjectType
+        if object.ObjectType not in [TOM.ObjectType.Table, TOM.ObjectType.Column]:
+            raise ValueError(
+                f"{icons.red_dot} The 'object' parameter must be a Table or Column object."
+            )
 
-        if objType == TOM.ObjectType.Column:
-            result = self.get_annotation_value(object=object, name="Vertipaq_TotalSize")
-        elif objType == TOM.ObjectType.Table:
-            result = self.get_annotation_value(object=object, name="Vertipaq_TotalSize")
+        result = self.get_annotation_value(object=object, name="Vertipaq_TotalSize")
 
         return int(result) if result is not None else 0
 
@@ -3166,17 +3477,28 @@ class TOMWrapper:
         """
         import Microsoft.AnalysisServices.Tabular as TOM
 
-        objType = object.ObjectType
-        objName = object.Name
-        objParentName = object.Parent.Name
+        obj_type = object.ObjectType
+        obj_name = object.Name
 
-        if objType == TOM.ObjectType.Table:
-            objParentName = objName
+        if object.ObjectType == TOM.ObjectType.CalculationItem:
+            obj_parent_name = object.Parent.Table.Name
+        else:
+            obj_parent_name = object.Parent.Name
+
+        if obj_type == TOM.ObjectType.Table:
+            obj_parent_name = obj_name
+            object_types = ["Table", "Calc Table"]
+        elif obj_type == TOM.ObjectType.Column:
+            object_types = ["Column", "Calc Column"]
+        elif obj_type == TOM.ObjectType.CalculationItem:
+            object_types = ["Calculation Item"]
+        else:
+            object_types = [str(obj_type)]
 
         fil = dependencies[
-            (dependencies["Object Type"] == str(objType))
-            & (dependencies["Table Name"] == objParentName)
-            & (dependencies["Object Name"] == objName)
+            (dependencies["Object Type"].isin(object_types))
+            & (dependencies["Table Name"] == obj_parent_name)
+            & (dependencies["Object Name"] == obj_name)
         ]
         meas = (
             fil[fil["Referenced Object Type"] == "Measure"]["Referenced Object"]
@@ -3184,14 +3506,16 @@ class TOMWrapper:
             .tolist()
         )
         cols = (
-            fil[fil["Referenced Object Type"] == "Column"][
+            fil[fil["Referenced Object Type"].isin(["Column", "Calc Column"])][
                 "Referenced Full Object Name"
             ]
             .unique()
             .tolist()
         )
         tbls = (
-            fil[fil["Referenced Object Type"] == "Table"]["Referenced Table"]
+            fil[fil["Referenced Object Type"].isin(["Table", "Calc Table"])][
+                "Referenced Table"
+            ]
             .unique()
             .tolist()
         )
@@ -3256,6 +3580,41 @@ class TOMWrapper:
             if t.Name in tbls:
                 yield t
 
+    def _get_expression(self, object):
+        """
+        Helper function to get the expression for any given TOM object.
+        """
+
+        import Microsoft.AnalysisServices.Tabular as TOM
+
+        valid_objects = [
+            TOM.ObjectType.Measure,
+            TOM.ObjectType.Table,
+            TOM.ObjectType.Column,
+            TOM.ObjectType.CalculationItem,
+        ]
+
+        if object.ObjectType not in valid_objects:
+            raise ValueError(
+                f"{icons.red_dot} The 'object' parameter must be one of these types: {valid_objects}."
+            )
+
+        if object.ObjectType == TOM.ObjectType.Measure:
+            expr = object.Expression
+        elif object.ObjectType == TOM.ObjectType.Table:
+            part = next(p for p in object.Partitions)
+            if part.SourceType == TOM.PartitionSourceType.Calculated:
+                expr = part.Source.Expression
+        elif object.ObjectType == TOM.ObjectType.Column:
+            if object.Type == TOM.ColumnType.Calculated:
+                expr = object.Expression
+        elif object.ObjectType == TOM.ObjectType.CalculationItem:
+            expr = object.Expression
+        else:
+            return
+
+        return expr
+
     def fully_qualified_measures(
         self, object: "TOM.Measure", dependencies: pd.DataFrame
     ):
@@ -3276,15 +3635,20 @@ class TOMWrapper:
         """
         import Microsoft.AnalysisServices.Tabular as TOM
 
+        dependencies = dependencies[
+            dependencies["Object Name"] == dependencies["Parent Node"]
+        ]
+
+        expr = self._get_expression(object=object)
+
         for obj in self.depends_on(object=object, dependencies=dependencies):
             if obj.ObjectType == TOM.ObjectType.Measure:
-                if (f"{obj.Parent.Name}[{obj.Name}]" in object.Expression) or (
-                    format_dax_object_name(obj.Parent.Name, obj.Name)
-                    in object.Expression
+                if (f"{obj.Parent.Name}[{obj.Name}]" in expr) or (
+                    format_dax_object_name(obj.Parent.Name, obj.Name) in expr
                 ):
                     yield obj
 
-    def unqualified_columns(self, object: "TOM.Column", dependencies: pd.DataFrame):
+    def unqualified_columns(self, object, dependencies: pd.DataFrame):
         """
         Obtains all unqualified column references for a given object.
 
@@ -3302,12 +3666,18 @@ class TOMWrapper:
         """
         import Microsoft.AnalysisServices.Tabular as TOM
 
+        dependencies = dependencies[
+            dependencies["Object Name"] == dependencies["Parent Node"]
+        ]
+
+        expr = self._get_expression(object=object)
+
         def create_pattern(tableList, b):
             patterns = [
-                r"(?<!" + re.escape(table) + r"\[)(?<!" + re.escape(table) + r"'\[)"
+                r"(?<!" + re.escape(table) + r")(?<!'" + re.escape(table) + r"')"
                 for table in tableList
             ]
-            combined_pattern = "".join(patterns) + re.escape(b)
+            combined_pattern = "".join(patterns) + re.escape(f"[{b}]")
             return combined_pattern
 
         for obj in self.depends_on(object=object, dependencies=dependencies):
@@ -3317,7 +3687,10 @@ class TOMWrapper:
                     if c.Name == obj.Name:
                         tableList.append(c.Parent.Name)
                 if (
-                    re.search(create_pattern(tableList, obj.Name), object.Expression)
+                    re.search(
+                        create_pattern(tableList, obj.Name),
+                        expr,
+                    )
                     is not None
                 ):
                     yield obj
@@ -3338,7 +3711,9 @@ class TOMWrapper:
         usingView = False
 
         if self.is_direct_lake():
-            df = check_fallback_reason(dataset=self._dataset, workspace=self._workspace)
+            df = check_fallback_reason(
+                dataset=self._dataset_id, workspace=self._workspace_id
+            )
             df_filt = df[df["FallbackReasonID"] == 2]
 
             if len(df_filt) > 0:
@@ -3346,14 +3721,14 @@ class TOMWrapper:
 
         return usingView
 
-    def has_incremental_refresh_policy(self, table_name: str):
+    def has_incremental_refresh_policy(self, object):
         """
         Identifies whether a table has an `incremental refresh <https://learn.microsoft.com/power-bi/connect-data/incremental-refresh-overview>`_ policy.
 
         Parameters
         ----------
-        table_name : str
-            Name of the table.
+        object : TOM Object
+            The TOM object within the semantic model. Accepts either a table or the model object.
 
         Returns
         -------
@@ -3361,13 +3736,21 @@ class TOMWrapper:
             An indicator whether a table has an incremental refresh policy.
         """
 
-        hasRP = False
-        rp = self.model.Tables[table_name].RefreshPolicy
+        import Microsoft.AnalysisServices.Tabular as TOM
 
-        if rp is not None:
-            hasRP = True
-
-        return hasRP
+        if object.ObjectType == TOM.ObjectType.Table:
+            if object.RefreshPolicy is not None:
+                return True
+            else:
+                return False
+        elif object.ObjectType == TOM.ObjectType.Model:
+            rp = False
+            for t in self.model.Tables:
+                if t.RefreshPolicy is not None:
+                    rp = True
+            return rp
+        else:
+            raise NotImplementedError
 
     def show_incremental_refresh_policy(self, table_name: str):
         """
@@ -3385,7 +3768,7 @@ class TOMWrapper:
 
         if rp is None:
             print(
-                f"{icons.yellow_dot} The '{table_name}' table in the '{self._dataset}' semantic model within the '{self._workspace}' workspace does not have an incremental refresh policy."
+                f"{icons.yellow_dot} The '{table_name}' table in the '{self._dataset_name}' semantic model within the '{self._workspace_name}' workspace does not have an incremental refresh policy."
             )
         else:
             print(f"Table Name: {table_name}")
@@ -3466,25 +3849,27 @@ class TOMWrapper:
         import Microsoft.AnalysisServices.Tabular as TOM
         import System
 
-        if not self.has_incremental_refresh_policy(table_name=table_name):
+        if not self.has_incremental_refresh_policy(
+            object=self.model.Tables[table_name]
+        ):
             print(
                 f"The '{table_name}' table does not have an incremental refresh policy."
             )
             return
 
-        incGran = ["Day", "Month", "Quarter", "Year"]
+        granularities = ["Day", "Month", "Quarter", "Year"]
 
         incremental_granularity = incremental_granularity.capitalize()
         rolling_window_granularity = rolling_window_granularity.capitalize()
 
-        if incremental_granularity not in incGran:
+        if incremental_granularity not in granularities:
             raise ValueError(
-                f"{icons.red_dot} Invalid 'incremental_granularity' value. Please choose from the following options: {incGran}."
+                f"{icons.red_dot} Invalid 'incremental_granularity' value. Please choose from the following options: {granularities}."
             )
 
-        if rolling_window_granularity not in incGran:
+        if rolling_window_granularity not in granularities:
             raise ValueError(
-                f"{icons.red_dot} Invalid 'rolling_window_granularity' value. Please choose from the following options: {incGran}."
+                f"{icons.red_dot} Invalid 'rolling_window_granularity' value. Please choose from the following options: {granularities}."
             )
 
         if rolling_window_periods < 1:
@@ -3884,14 +4269,14 @@ class TOMWrapper:
 
         if table_name is None:
             raise ValueError(
-                f"{icons.red_dot} The '{measure_name}' is not a valid measure in the '{self._dataset}' semantic model within the '{self._workspace}' workspace."
+                f"{icons.red_dot} The '{measure_name}' is not a valid measure in the '{self._dataset_name}' semantic model within the '{self._workspace_name}' workspace."
             )
 
         table_name = matching_measures[0]
         # Validate date table
         if not self.is_date_table(date_table):
             raise ValueError(
-                f"{icons.red_dot} The '{date_table}' table is not a valid date table in the '{self._dataset}' wemantic model within the '{self._workspace}' workspace."
+                f"{icons.red_dot} The '{date_table}' table is not a valid date table in the '{self._dataset_name}' wemantic model within the '{self._workspace_name}' workspace."
             )
 
         # Extract date key from date table
@@ -3903,7 +4288,7 @@ class TOMWrapper:
 
         if not matching_columns:
             raise ValueError(
-                f"{icons.red_dot} The '{date_table}' table does not have a date key column in the '{self._dataset}' semantic model within the '{self._workspace}' workspace."
+                f"{icons.red_dot} The '{date_table}' table does not have a date key column in the '{self._dataset_name}' semantic model within the '{self._workspace_name}' workspace."
             )
 
         date_key = matching_columns[0]
@@ -4349,7 +4734,7 @@ class TOMWrapper:
     def generate_measure_descriptions(
         self,
         measure_name: Optional[str | List[str]] = None,
-        max_batch_size: Optional[int] = 5,
+        max_batch_size: Optional[int] = 1,
     ) -> pd.DataFrame:
         """
         Auto-generates descriptions for measures using an LLM. This function requires a paid F-sku (Fabric) of F64 or higher.
@@ -4361,14 +4746,15 @@ class TOMWrapper:
         measure_name : str | List[str], default=None
             The measure name (or a list of measure names).
             Defaults to None which generates descriptions for all measures in the semantic model.
-        max_batch_size : int, default=5
-            Sets the max batch size for each API call.
+        max_batch_size : int, default=1
+            Sets the max batch size for each API call. This parameter has been decomissioned.
 
         Returns
         -------
         pandas.DataFrame
             A pandas dataframe showing the updated measure(s) and their new description(s).
         """
+
         icons.sll_tags.append("GenerateMeasureDescriptions")
 
         df = pd.DataFrame(
@@ -4383,52 +4769,39 @@ class TOMWrapper:
         if isinstance(measure_name, str):
             measure_name = [measure_name]
 
-        workspace_id = fabric.resolve_workspace_id(self._workspace)
-        client = fabric.FabricRestClient()
-
-        if len(measure_name) > max_batch_size:
-            measure_lists = [
-                measure_name[i : i + max_batch_size]
-                for i in range(0, len(measure_name), max_batch_size)
-            ]
-        else:
-            measure_lists = [measure_name]
-
-        # Each API call can have a max of 5 measures
-        for measure_list in measure_lists:
-            payload = {
-                "scenarioDefinition": {
-                    "generateModelItemDescriptions": {
-                        "modelItems": [],
-                    },
+        payload = {
+            "scenarioDefinition": {
+                "generateModelItemDescriptions": {
+                    "modelItems": [],
                 },
-                "workspaceId": workspace_id,
-                "artifactInfo": {"artifactType": "SemanticModel"},
-            }
-            for m_name in measure_list:
-                expr, t_name = next(
-                    (ms.Expression, ms.Parent.Name)
-                    for ms in self.all_measures()
-                    if ms.Name == m_name
-                )
-                if t_name is None:
-                    raise ValueError(
-                        f"{icons.red_dot} The '{m_name}' measure does not exist in the '{self._dataset}' semantic model within the '{self._workspace}' workspace."
-                    )
+            },
+            "workspaceId": self._workspace_id,
+            "artifactInfo": {"artifactType": "SemanticModel"},
+        }
 
-                new_item = {
-                    "urn": m_name,
+        for m in measure_name:
+            (table_name, expr) = next(
+                (ms.Parent.Name, ms.Expression)
+                for ms in self.all_measures()
+                if ms.Name == m
+            )
+            payload["scenarioDefinition"]["generateModelItemDescriptions"][
+                "modelItems"
+            ].append(
+                {
+                    "urn": m,
                     "type": 1,
-                    "name": m_name,
+                    "name": m,
                     "expression": expr,
                 }
-                payload["scenarioDefinition"]["generateModelItemDescriptions"][
-                    "modelItems"
-                ].append(new_item)
+            )
 
-            response = client.post("/explore/v202304/nl2nl/completions", json=payload)
-            if response.status_code != 200:
-                raise FabricHTTPException(response)
+            response = _base_api(
+                request="explore/v202304/nl2nl/completions",
+                client="internal",
+                method="post",
+                payload=payload,
+            )
 
             for item in response.json().get("modelItems", []):
                 ms_name = item["urn"]
@@ -4457,41 +4830,6 @@ class TOMWrapper:
 
         return df
 
-        # def process_measure(m):
-        #     table_name = m.Parent.Name
-        #     m_name = m.Name
-        #     m_name_fixed = "1"
-        #     expr = m.Expression
-        #     if measure_name is None or m_name in measure_name:
-        #         payload = {
-        #             "scenarioDefinition": {
-        #                 "generateModelItemDescriptions": {
-        #                     "modelItems": [
-        #                         {
-        #                             "urn": f"modelobject://Table/{table_name}/Measure/{m_name_fixed}",
-        #                             "type": 1,
-        #                             "name": m_name,
-        #                             "expression": expr,
-        #                         }
-        #                     ]
-        #                 }
-        #             },
-        #             "workspaceId": workspace_id,
-        #             "artifactInfo": {"artifactType": "SemanticModel"},
-        #         }
-
-        #         response = client.post(
-        #             "/explore/v202304/nl2nl/completions", json=payload
-        #         )
-        #         if response.status_code != 200:
-        #             raise FabricHTTPException(response)
-
-        #         desc = response.json()["modelItems"][0]["description"]
-        #         m.Description = desc
-
-        # with concurrent.futures.ThreadPoolExecutor() as executor:
-        #     executor.map(process_measure, self.all_measures())
-
     def set_value_filter_behavior(self, value_filter_behavior: str = "Automatic"):
         """
         Sets the `Value Filter Behavior <https://learn.microsoft.com/power-bi/transform-model/value-filter-behavior>`_ property for the semantic model.
@@ -4508,38 +4846,1117 @@ class TOMWrapper:
         value_filter_behavior = value_filter_behavior.capitalize()
         min_compat = 1606
 
-        if self.model.Model.Database.CompatibilityLevel < min_compat:
-            self.model.Model.Database.CompatibilityLevel = min_compat
+        if self.model.Database.CompatibilityLevel < min_compat:
+            self.model.Database.CompatibilityLevel = min_compat
 
         self.model.ValueFilterBehavior = System.Enum.Parse(
             TOM.ValueFilterBehaviorType, value_filter_behavior
         )
 
+    def add_role_member(
+        self,
+        role_name: str,
+        member: str | List[str],
+        role_member_type: Optional[str] = "User",
+    ):
+        """
+        Adds an external model role member (AzureAD) to a role.
+
+        Parameters
+        ----------
+        role_name : str
+            The role name.
+        member : str | List[str]
+            The email address(es) of the member(s) to add.
+        role_member_type : str, default="User"
+            The type of the role member. Default is "User". Other options include "Group" for Azure AD groups.
+            All members must be of the same role_member_type.
+        """
+
+        import Microsoft.AnalysisServices.Tabular as TOM
+        import System
+
+        if isinstance(member, str):
+            member = [member]
+
+        role_member_type = role_member_type.capitalize()
+        if role_member_type not in ["User", "Group"]:
+            raise ValueError(
+                f"{icons.red_dot} The '{role_member_type}' is not a valid role member type. Valid options: 'User', 'Group'."
+            )
+
+        role = self.model.Roles[role_name]
+        current_members = [m.MemberName for m in role.Members]
+
+        for m in member:
+            if m not in current_members:
+                rm = TOM.ExternalModelRoleMember()
+                rm.IdentityProvider = "AzureAD"
+                rm.MemberName = m
+                rm.MemberType = System.Enum.Parse(TOM.RoleMemberType, role_member_type)
+                role.Members.Add(rm)
+                print(
+                    f"{icons.green_dot} '{m}' has been added as a member of the '{role_name}' role."
+                )
+            else:
+                print(
+                    f"{icons.yellow_dot} '{m}' is already a member in the '{role_name}' role."
+                )
+
+    def remove_role_member(self, role_name: str, member: str | List[str]):
+        """
+        Removes an external model role member (AzureAD) from a role.
+
+        Parameters
+        ----------
+        role_name : str
+            The role name.
+        member : str | List[str]
+            The email address(es) of the member(s) to remove.
+        """
+
+        if isinstance(member, str):
+            member = [member]
+
+        role = self.model.Roles[role_name]
+        current_members = {m.MemberName: m.Name for m in role.Members}
+        for m in member:
+            name = current_members.get(m)
+            if name is not None:
+                role.Members.Remove(role.Members[name])
+                print(
+                    f"{icons.green_dot} The '{m}' member has been removed from the '{role_name}' role."
+                )
+            else:
+                print(
+                    f"{icons.yellow_dot} '{m}' is not a member of the '{role_name}' role."
+                )
+
+    def get_bim(self) -> dict:
+        """
+        Retrieves the .bim file for the semantic model.
+
+        Returns
+        -------
+        dict
+            The .bim file.
+        """
+
+        import Microsoft.AnalysisServices.Tabular as TOM
+
+        bim = (
+            json.loads(TOM.JsonScripter.ScriptCreate(self.model.Database))
+            .get("create")
+            .get("database")
+        )
+
+        return bim
+
+    def clear_linguistic_schema(self, culture: str):
+        """
+        Clears the linguistic schema for a given culture.
+
+        Parameters
+        ----------
+        culture : str
+            The culture name.
+        """
+
+        empty_schema = f'{{"Version":"1.0.0","Language":"{culture}"}}'
+
+        self.model.Cultures[culture].LinguisticMetadata.Content = json.dumps(
+            empty_schema, indent=4
+        )
+
+    def get_linguistic_schema(self, culture: str) -> dict:
+        """
+        Obtains the linguistic schema for a given culture.
+
+        Parameters
+        ----------
+        culture : str
+            The culture name.
+
+        Returns
+        -------
+        dict
+            The .bim file.
+        """
+
+        import Microsoft.AnalysisServices.Tabular as TOM
+
+        bim = (
+            json.loads(TOM.JsonScripter.ScriptCreate(self.model.Database))
+            .get("create")
+            .get("database")
+        )
+
+        return bim
+
+    def _reduce_model(self, perspective_name: str):
+        """
+        Reduces a model's objects based on a perspective. Adds the dependent objects within a perspective to that perspective.
+        """
+
+        import Microsoft.AnalysisServices.Tabular as TOM
+        from sempy_labs._model_dependencies import get_model_calc_dependencies
+
+        if not any(p.Name == perspective_name for p in self.model.Perspectives):
+            raise ValueError(
+                f"{icons.red_dot} The '{perspective_name}' is not a valid perspective in the '{self._dataset_name}' semantic model within the '{self._workspace_name}' workspace."
+            )
+
+        dep = get_model_calc_dependencies(
+            dataset=self._dataset_id, workspace=self._workspace_id
+        )
+        dep_filt = dep[
+            dep["Object Type"].isin(
+                [
+                    "Rows Allowed",
+                    "Measure",
+                    "Calc Item",
+                    "Calc Column",
+                    "Calc Table",
+                    "Hierarchy",
+                ]
+            )
+        ]
+
+        tables = dfP[dfP["Object Type"] == "Table"]["Table Name"].tolist()
+        measures = dfP[dfP["Object Type"] == "Measure"]["Object Name"].tolist()
+        columns = dfP[dfP["Object Type"] == "Column"][["Table Name", "Object Name"]]
+        cols = [
+            f"'{row[0]}'[{row[1]}]"
+            for row in columns.itertuples(index=False, name=None)
+        ]
+        hierarchies = dfP[dfP["Object Type"] == "Hierarchy"][
+            ["Table Name", "Object Name"]
+        ]
+        hier = [
+            f"'{row[0]}'[{row[1]}]"
+            for row in hierarchies.itertuples(index=False, name=None)
+        ]
+        filt = dep_filt[
+            (dep_filt["Object Type"].isin(["Rows Allowed", "Calc Item"]))
+            | (dep_filt["Object Type"] == "Measure")
+            & (dep_filt["Object Name"].isin(measures))
+            | (dep_filt["Object Type"] == "Calc Table")
+            & (dep_filt["Object Name"].isin(tables))
+            | (
+                (dep_filt["Object Type"].isin(["Calc Column"]))
+                & (
+                    dep_filt.apply(
+                        lambda row: f"'{row['Table Name']}'[{row['Object Name']}]",
+                        axis=1,
+                    ).isin(cols)
+                )
+            )
+            | (
+                (dep_filt["Object Type"].isin(["Hierarchy"]))
+                & (
+                    dep_filt.apply(
+                        lambda row: f"'{row['Table Name']}'[{row['Object Name']}]",
+                        axis=1,
+                    ).isin(hier)
+                )
+            )
+        ]
+
+        result_df = pd.DataFrame(columns=["Table Name", "Object Name", "Object Type"])
+
+        def add_to_result(table_name, object_name, object_type, dataframe):
+
+            new_data = {
+                "Table Name": table_name,
+                "Object Name": object_name,
+                "Object Type": object_type,
+            }
+
+            return pd.concat(
+                [dataframe, pd.DataFrame(new_data, index=[0])], ignore_index=True
+            )
+
+        for _, r in filt.iterrows():
+            added = False
+            obj_type = r["Referenced Object Type"]
+            table_name = r["Referenced Table"]
+            object_name = r["Referenced Object"]
+            if obj_type in ["Column", "Attribute Hierarchy"]:
+                obj = self.model.Tables[table_name].Columns[object_name]
+                if not self.in_perspective(
+                    object=obj, perspective_name=perspective_name
+                ):
+                    self.add_to_perspective(
+                        object=obj, perspective_name=perspective_name, include_all=False
+                    )
+                    added = True
+            elif obj_type == "Measure":
+                obj = self.model.Tables[table_name].Measures[object_name]
+                if not self.in_perspective(
+                    object=obj, perspective_name=perspective_name
+                ):
+                    self.add_to_perspective(
+                        object=obj, perspective_name=perspective_name, include_all=False
+                    )
+                    added = True
+            elif obj_type == "Table":
+                obj = self.model.Tables[table_name]
+                if not self.in_perspective(
+                    object=obj, perspective_name=perspective_name
+                ):
+                    self.add_to_perspective(
+                        object=obj, perspective_name=perspective_name, include_all=False
+                    )
+                    added = True
+            if added:
+                result_df = add_to_result(table_name, object_name, obj_type, result_df)
+
+        # Reduce model...
+
+        # Remove unnecessary relationships
+        for r in self.model.Relationships:
+            if (
+                not self.in_perspective(
+                    object=r.FromTable, perspective_name=perspective_name
+                )
+            ) or (
+                not self.in_perspective(
+                    object=r.ToTable, perspective_name=perspective_name
+                )
+            ):
+                self.remove_object(object=r)
+
+        # Ensure relationships in reduced model have base columns
+        for r in self.model.Relationships:
+            if not self.in_perspective(r.FromColumn, perspective_name=perspective_name):
+                self.add_to_perspective(
+                    object=r.FromColumn, perspective_name=perspective_name
+                )
+
+                result_df = add_to_result(
+                    r.FromTable.Name, r.FromColumn.Name, "Column", result_df
+                )
+            if not self.in_perspective(r.ToColumn, perspective_name=perspective_name):
+                table_name = r.ToTable.Name
+                object_name = r.ToColumn.Name
+                self.add_to_perspective(
+                    object=r.ToColumn, perspective_name=perspective_name
+                )
+
+                result_df = add_to_result(
+                    r.ToTable.Name, r.ToColumn.Name, "Column", result_df
+                )
+
+        # Remove objects not in the perspective
+        for t in self.model.Tables:
+            if not self.in_perspective(object=t, perspective_name=perspective_name):
+                self.remove_object(object=t)
+            else:
+                for attr in ["Columns", "Measures", "Hierarchies"]:
+                    for obj in getattr(t, attr):
+                        if attr == "Columns" and obj.Type == TOM.ColumnType.RowNumber:
+                            pass
+                        elif not self.in_perspective(
+                            object=obj, perspective_name=perspective_name
+                        ):
+                            self.remove_object(object=obj)
+
+        # Return the objects added to the perspective based on dependencies
+        return result_df.drop_duplicates()
+
+    def convert_direct_lake_to_import(
+        self,
+        table_name: str,
+        entity_name: Optional[str] = None,
+        schema: Optional[str] = None,
+        source: Optional[str | UUID] = None,
+        source_type: str = "Lakehouse",
+        source_workspace: Optional[str | UUID] = None,
+    ):
+        """
+        Converts a Direct Lake table's partition to an import-mode partition.
+
+        The entity_name and schema parameters default to using the existing values in the Direct Lake partition. The source, source_type, and source_workspace
+        parameters do not default to existing values. This is because it may not always be possible to reconcile the source and its workspace.
+
+        Parameters
+        ----------
+        table_name : str
+            The table name.
+        entity_name : str, default=None
+            The entity name of the Direct Lake partition (the table name in the source).
+        schema : str, default=None
+            The schema of the source table. Defaults to None which resolves to the existing schema.
+        source : str | uuid.UUID, default=None
+            The source name or ID. This is the name or ID of the Lakehouse or Warehouse.
+        source_type : str, default="Lakehouse"
+            The source type (i.e. "Lakehouse" or "Warehouse").
+        source_workspace: str | uuid.UUID, default=None
+            The workspace name or ID of the source. This is the workspace in which the Lakehouse or Warehouse exists.
+            Defaults to None which resolves to the workspace of the attached lakehouse
+            or if no lakehouse attached, resolves to the workspace of the notebook.
+        """
+        import Microsoft.AnalysisServices.Tabular as TOM
+
+        t = self.model.Tables[table_name]
+
+        p = next(p for p in t.Partitions)
+        if p.Mode != TOM.ModeType.DirectLake:
+            print(f"{icons.info} The '{table_name}' table is not in Direct Lake mode.")
+            return
+
+        partition_name = p.Name
+        partition_entity_name = entity_name or p.Source.EntityName
+        partition_schema = schema or p.Source.SchemaName
+
+        # Update name of the Direct Lake partition (will be removed later)
+        t.Partitions[partition_name].Name = f"{partition_name}_remove"
+
+        source_workspace_id = resolve_workspace_id(workspace=source_workspace)
+        if source_type == "Lakehouse":
+            item_id = resolve_lakehouse_id(
+                lakehouse=source, workspace=source_workspace_id
+            )
+        else:
+            item_id = resolve_item_id(
+                item=source, type=source_type, workspace=source_workspace_id
+            )
+
+        column_pairs = []
+        m_filter = None
+        for c in t.Columns:
+            if c.Type == TOM.ColumnType.Data:
+                if c.Name != c.SourceColumn:
+                    column_pairs.append((c.SourceColumn, c.Name))
+
+        if column_pairs:
+            m_filter = (
+                f'#"Renamed Columns" = Table.RenameColumns(ToDelta, {{'
+                + ", ".join([f'{{"{old}", "{new}"}}' for old, new in column_pairs])
+                + "})"
+            )
+
+        def _generate_m_expression(
+            workspace_id, artifact_id, artifact_type, table_name, schema_name, m_filter
+        ):
+            """
+            Generates the M expression for the import partition. Adds a rename step if any columns have been renamed in the model.
+            """
+
+            full_table_name = (
+                f"{schema_name}/{table_name}" if schema_name else table_name
+            )
+
+            code = f"""let\n\tSource = AzureStorage.DataLake("https://onelake.dfs.fabric.microsoft.com/{workspace_id}/{artifact_id}", [HierarchicalNavigation=true]),
+        Tables = Source{{[Name = "Tables"]}}[Content],
+        ExpressionTable = Tables{{[Name = "{full_table_name}"]}}[Content],
+        ToDelta = DeltaLake.Table(ExpressionTable)"""
+            if m_filter is None:
+                code += "\n in\n\tToDelta"
+            else:
+                code += f',\n\t {m_filter} \n in\n\t#"Renamed Columns"'
+
+            return code
+
+        m_expression = _generate_m_expression(
+            source_workspace_id,
+            item_id,
+            source_type,
+            partition_entity_name,
+            partition_schema,
+            m_filter,
+        )
+
+        # Add the import partition
+        self.add_m_partition(
+            table_name=table_name,
+            partition_name=f"{partition_name}",
+            expression=m_expression,
+            mode="Import",
+        )
+        # Remove the Direct Lake partition
+        self.remove_object(object=p)
+
+        print(
+            f"{icons.green_dot} The '{table_name}' table has been converted to Import mode."
+        )
+
+    def copy_object(
+        self,
+        object,
+        target_dataset: str | UUID,
+        target_workspace: Optional[str | UUID] = None,
+        readonly: bool = False,
+    ):
+        """
+        Copies a semantic model object from the current semantic model to the target semantic model.
+
+        Parameters
+        ----------
+        object : TOM Object
+            The TOM object to be copied to the target semantic model. For example: tom.model.Tables['Sales'].
+        target_dataset : str | uuid.UUID
+            Name or ID of the target semantic model.
+        target_workspace : str | uuid.UUID, default=None
+            The Fabric workspace name or ID.
+            Defaults to None which resolves to the workspace of the attached lakehouse
+            or if no lakehouse attached, resolves to the workspace of the notebook.
+        readonly : bool, default=False
+            Whether the connection is read-only or read/write. Setting this to False enables read/write which saves the changes made back to the server.
+        """
+
+        import Microsoft.AnalysisServices.Tabular as TOM
+
+        clone = object.Clone()
+        with connect_semantic_model(
+            dataset=target_dataset,
+            workspace=target_workspace,
+            readonly=readonly,
+        ) as target_tom:
+            if isinstance(object, TOM.Table):
+                target_tom.model.Tables.Add(clone)
+            elif isinstance(object, TOM.Column):
+                target_tom.model.Tables[object.Parent.Name].Columns.Add(clone)
+            elif isinstance(object, TOM.Measure):
+                target_tom.model.Tables[object.Parent.Name].Measures.Add(clone)
+            elif isinstance(object, TOM.Hierarchy):
+                target_tom.model.Tables[object.Parent.Name].Hierarchies.Add(clone)
+            elif isinstance(object, TOM.Level):
+                target_tom.model.Tables[object.Parent.Parent.Name].Hierarchies[
+                    object.Parent.Name
+                ].Levels.Add(clone)
+            elif isinstance(object, TOM.Role):
+                target_tom.model.Roles.Add(clone)
+            elif isinstance(object, TOM.Relationship):
+                target_tom.model.Relationships.Add(clone)
+            else:
+                raise NotImplementedError(
+                    f"{icons.red_dot} The '{object.ObjectType}' object type is not supported."
+                )
+            print(
+                f"{icons.green_dot} The '{object.Name}' {str(object.ObjectType).lower()} has been copied to the '{target_dataset}' semantic model within the '{target_workspace}' workspace."
+            )
+
+    def format_dax(
+        self,
+        object: Optional[
+            Union[
+                "TOM.Measure",
+                "TOM.CalcultedColumn",
+                "TOM.CalculationItem",
+                "TOM.CalculatedTable",
+                "TOM.TablePermission",
+            ]
+        ] = None,
+    ):
+        """
+        Formats the DAX expressions of measures, calculated columns, calculation items, calculated tables and row level security expressions in the semantic model.
+
+        This function uses the `DAX Formatter API <https://www.daxformatter.com/>`_.
+
+        Parameters
+        ----------
+        object : TOM Object, default=None
+            The TOM object to format. If None, formats all measures, calculated columns, calculation items, calculated tables and row level security expressions in the semantic model.
+            If a specific object is provided, only that object will be formatted.
+        """
+
+        import Microsoft.AnalysisServices.Tabular as TOM
+
+        if object is None:
+            object_map = {
+                "measures": self.all_measures,
+                "calculated_columns": self.all_calculated_columns,
+                "calculation_items": self.all_calculation_items,
+                "calculated_tables": self.all_calculated_tables,
+                "rls": self.all_rls,
+            }
+
+            for key, func in object_map.items():
+                for obj in func():
+                    if key == "calculated_tables":
+                        p = next(p for p in obj.Partitions)
+                        name = obj.Name
+                        expr = p.Source.Expression
+                        table = obj.Name
+                    elif key == "calculation_items":
+                        name = obj.Name
+                        expr = obj.Expression
+                        table = obj.Parent.Table.Name
+                    elif key == "rls":
+                        name = obj.Role.Name
+                        expr = obj.FilterExpression
+                        table = obj.Table.Name
+                    else:
+                        name = obj.Name
+                        expr = obj.Expression
+                        table = obj.Table.Name
+                    self._dax_formatting[key].append(
+                        {
+                            "name": name,
+                            "expression": expr,
+                            "table": table,
+                        }
+                    )
+            return
+
+        if object.ObjectType == TOM.ObjectType.Measure:
+            self._dax_formatting["measures"].append(
+                {
+                    "name": object.Name,
+                    "expression": object.Expression,
+                    "table": object.Parent.Name,
+                }
+            )
+        elif object.ObjectType == TOM.ObjectType.CalculatedColumn:
+            self._dax_formatting["measures"].append(
+                {
+                    "name": object.Name,
+                    "expression": object.Expression,
+                    "table": object.Parent.Name,
+                }
+            )
+        elif object.ObjectType == TOM.ObjectType.CalculationItem:
+            self._dax_formatting["measures"].append(
+                {
+                    "name": object.Name,
+                    "expression": object.Expression,
+                    "table": object.Parent.Name,
+                }
+            )
+        elif object.ObjectType == TOM.ObjectType.CalculatedTable:
+            self._dax_formatting["measures"].append(
+                {
+                    "name": object.Name,
+                    "expression": object.Expression,
+                    "table": object.Name,
+                }
+            )
+        else:
+            raise ValueError(
+                f"{icons.red_dot} The '{str(object.ObjectType)}' object type is not supported for DAX formatting."
+            )
+
+    def get_linguistic_schema(self, culture: str) -> dict:
+        """
+        Obtains the linguistic schema for a given culture.
+        Parameters
+        ----------
+        culture : str
+            The culture name.
+        Returns
+        -------
+        dict
+            The linguistic schema for the given culture.
+        """
+
+        c = self.model.Cultures[culture]
+        if c.LinguisticMetadata is not None:
+            return json.loads(c.LinguisticMetadata.Content)
+        else:
+            print(
+                f"{icons.info} The '{culture}' culture does not have a linguistic schema."
+            )
+            return None
+
+    def _add_linguistic_schema(self, culture: str):
+
+        import Microsoft.AnalysisServices.Tabular as TOM
+
+        # TODO: if LinguisticMetadata is None
+        # TODO: check if lower() is good enough
+        # TODO: 'in' vs 'has' in relationships
+        # TODO: 'SemanticSlots' in relationships
+
+        c = self.model.Cultures[culture]
+        if c.LinguisticMetadata is not None:
+            lm = json.loads(c.LinguisticMetadata.Content)
+
+            def add_entity(entity, conecptual_entity, conceptual_property):
+                lm["Entities"][entity] = {
+                    "Definition": {
+                        "Binding": {
+                            "ConceptualEntity": conecptual_entity,
+                            "ConceptualProperty": conceptual_property,
+                        }
+                    },
+                    "State": "Generated",
+                    "Terms": [],
+                }
+
+            def add_relationship(rel_key, table_name, t_name, o_name):
+                lm["Relationships"][rel_key] = {
+                    "Binding": {"ConceptualEntity": table_name},
+                    "State": "Generated",
+                    "Roles": {
+                        t_name: {"Target": {"Entity": t_name}},
+                        f"{t_name}.{o_name}": {
+                            "Target": {"Entity": f"{t_name}.{o_name}"}
+                        },
+                    },
+                    "Phrasings": [
+                        {
+                            "Attribute": {
+                                "Subject": {"Role": t_name},
+                                "Object": {"Role": f"{t_name}.{o_name}"},
+                            },
+                            "State": "Generated",
+                            "Weight": 0.99,
+                            "ID": f"{t_name}_have_{o_name}",
+                        }
+                    ],
+                }
+
+            if "Entities" not in lm:
+                lm["Entities"] = {}
+                for t in self.model.Tables:
+                    t_lower = t.Name.lower()
+                    lm["Entities"][t_lower] = {
+                        "Definition": {"Binding": {"ConceptualEntity": t.Name}},
+                        "State": "Generated",
+                        "Terms": [],
+                    }
+                    for c in t.Columns:
+                        if c.Type != TOM.ColumnType.RowNumber:
+                            c_lower = f"{t_lower}.{c.Name.lower()}"
+                            add_entity(c_lower, t.Name, c.Name)
+                    for m in t.Measures:
+                        m_lower = f"{t_lower}.{m.Name.lower()}"
+                        add_entity(m_lower, t.Name, m.Name)
+                    for h in t.Hierarchies:
+                        h_lower = f"{t_lower}.{h.Name.lower()}"
+                        add_entity(h_lower, t.Name, h.Name)
+            # if "Relationships" not in lm:
+            #    lm["Relationships"] = {}
+            #    for c in self.all_columns():
+            #        table_name = c.Parent.Name
+            #        t_name = table_name.lower()
+            #        object_name = c.Name
+            #        o_name = object_name.lower()
+            #        rel_key = f"{t_name}_has_{o_name}"
+            #        add_relationship(rel_key, table_name, t_name, o_name)
+            #    for m in self.all_measures():
+            #        table_name = c.Parent.Name
+            #        t_name = table_name.lower()
+            #        object_name = m.Name
+            #        o_name = object_name.lower()
+            #        rel_key = f"{t_name}_has_{o_name}"
+            #        add_relationship(rel_key, table_name, t_name, o_name)
+
+            self.model.Cultures[culture].LinguisticMetadata.Content = json.dumps(lm)
+
+    @staticmethod
+    def _get_synonym_info(
+        lm: dict,
+        object: Union["TOM.Table", "TOM.Column", "TOM.Measure", "TOM.Hierarchy"],
+        synonym_name: str,
+    ):
+
+        import Microsoft.AnalysisServices.Tabular as TOM
+
+        object_type = object.ObjectType
+        obj = None
+        syn_exists = False
+
+        for key, v in lm.get("Entities", []).items():
+            binding = v.get("Definition", {}).get("Binding", {})
+            t_name = binding.get("ConceptualEntity")
+            o_name = binding.get("ConceptualProperty")
+
+            if (
+                object_type == TOM.ObjectType.Table
+                and t_name == object.Name
+                and o_name is None
+            ) or (
+                object_type
+                in [
+                    TOM.ObjectType.Column,
+                    TOM.ObjectType.Measure,
+                    TOM.ObjectType.Hierarchy,
+                ]
+                and t_name == object.Parent.Name
+                and o_name == object.Name
+            ):
+                obj = key
+                terms = v.get("Terms", [])
+                syn_exists = any(synonym_name in term for term in terms)
+                # optionally break early if match is found
+                break
+
+        return obj, syn_exists
+
+    def set_synonym(
+        self,
+        culture: str,
+        object: Union["TOM.Table", "TOM.Column", "TOM.Measure", "TOM.Hierarchy"],
+        synonym_name: str,
+        weight: Optional[Decimal] = None,
+    ):
+        """
+        Sets a synonym for a table/column/measure/hierarchy in the linguistic schema of the semantic model. This function is currently in preview.
+
+        Parameters
+        ----------
+        culture : str
+            The culture name for which the synonym is being set. Example: 'en-US'.
+        object : TOM Object
+            The TOM object for which the synonym is being set. This can be a table, column, measure, or hierarchy.
+        synonym_name : str
+            The name of the synonym to be set.
+        weight : Decimal, default=None
+            The weight of the synonym. If None, the default weight is used. The weight must be a Decimal value between 0 and 1.
+        """
+
+        import Microsoft.AnalysisServices.Tabular as TOM
+
+        object_type = object.ObjectType
+
+        if object_type not in [
+            TOM.ObjectType.Table,
+            TOM.ObjectType.Column,
+            TOM.ObjectType.Measure,
+            TOM.ObjectType.Hierarchy,
+        ]:
+            raise ValueError(
+                f"{icons.red_dot} This function only supports adding synonyms for tables/columns/measures/hierarchies."
+            )
+
+        # Add base linguistic schema in case it does not yet exist
+        self._add_linguistic_schema(culture=culture)
+
+        # Extract linguistic metadata content
+        lm = json.loads(self.model.Cultures[culture].LinguisticMetadata.Content)
+
+        # Generate synonym dictionary
+        _validate_weight(weight)
+        now = datetime.now().isoformat(timespec="milliseconds") + "Z"
+        syn_dict = {"Type": "Noun", "State": "Authored", "LastModified": now}
+        if weight is not None:
+            syn_dict["Weight"] = weight
+
+        updated = False
+
+        (obj, syn_exists) = self._get_synonym_info(
+            lm=lm, object=object, synonym_name=synonym_name
+        )
+
+        entities = lm.get("Entities", {})
+
+        def get_unique_entity_key(object, object_type, entities):
+
+            if object_type == TOM.ObjectType.Table:
+                base_obj = object.Name.lower().replace(" ", "_")
+            else:
+                base_obj = f"{object.Parent.Name}.{object.Name}".lower().replace(
+                    " ", "_"
+                )
+
+            obj = base_obj
+            counter = 1
+            existing_keys = set(entities.keys())
+
+            # Make sure the object name is unique
+            while obj in existing_keys:
+                obj = f"{base_obj}_{counter}"
+                counter += 1
+
+            return obj
+
+        # Update linguistic metadata content
+        if obj is None:
+            obj = get_unique_entity_key(object, object_type, entities)
+            lm["Entities"][obj] = {
+                "Definition": {"Binding": {}},
+                "State": "Authored",
+                "Terms": [
+                    {synonym_name: syn_dict},
+                ],
+            }
+            if object_type == TOM.ObjectType.Table:
+                lm["Entities"][obj]["Definition"]["Binding"][
+                    "ConceptualEntity"
+                ] = object.Name
+            else:
+                lm["Entities"][obj]["Definition"]["Binding"][
+                    "ConceptualEntity"
+                ] = object.Parent.Name
+                lm["Entities"][obj]["Definition"]["Binding"][
+                    "ConceptualProperty"
+                ] = object.Name
+            updated = True
+        elif not syn_exists:
+            lm["Entities"][obj]["Terms"].append({synonym_name: syn_dict})
+            updated = True
+        else:
+            for term in lm["Entities"][obj]["Terms"]:
+                if term == synonym_name:
+                    lm["Entities"][obj]["Terms"][term] = syn_dict
+            updated = True
+
+        if "State" in lm["Entities"][obj]:
+            del lm["Entities"][obj]["State"]
+
+        if updated:
+            self.model.Cultures[culture].LinguisticMetadata.Content = json.dumps(
+                lm, indent=4
+            )
+            if object_type == TOM.ObjectType.Table:
+                print(
+                    f"{icons.green_dot} The '{synonym_name}' synonym was set for the '{object.Name}' table."
+                )
+            else:
+                print(
+                    f"{icons.green_dot} The '{synonym_name}' synonym was set for the '{object.Parent.Name}'[{object.Name}] column."
+                )
+
+    def delete_synonym(
+        self,
+        culture: str,
+        object: Union["TOM.Table", "TOM.Column", "TOM.Measure", "TOM.Hierarchy"],
+        synonym_name: str,
+    ):
+        """
+        Deletes a synonym for a table/column/measure/hierarchy in the linguistic schema of the semantic model. This function is currently in preview.
+
+        Parameters
+        ----------
+        culture : str
+            The culture name for which the synonym is being deleted. Example: 'en-US'.
+        object : TOM Object
+            The TOM object for which the synonym is being deleted. This can be a table, column, measure, or hierarchy.
+        synonym_name : str
+            The name of the synonym to be deleted.
+        """
+
+        import Microsoft.AnalysisServices.Tabular as TOM
+
+        if not any(c.Name == culture for c in self.model.Cultures):
+            raise ValueError(
+                f"{icons.red_dot} The '{culture}' culture does not exist within the semantic model."
+            )
+
+        if object.ObjectType not in [
+            TOM.ObjectType.Table,
+            TOM.ObjectType.Column,
+            TOM.ObjectType.Measure,
+            TOM.ObjectType.Hierarchy,
+        ]:
+            raise ValueError(
+                f"{icons.red_dot} This function only supports tables/columns/measures/hierarchies."
+            )
+
+        lm = json.loads(self.model.Cultures[culture].LinguisticMetadata.Content)
+
+        if "Entities" not in lm:
+            print(
+                f"{icons.warning} There is no linguistic schema for the '{culture}' culture."
+            )
+            return
+
+        (obj, syn_exists) = self._get_synonym_info(
+            lm=lm, object=object, synonym_name=synonym_name
+        )
+
+        # Mark the synonym as deleted if it exists
+        if obj is not None and syn_exists:
+            data = lm["Entities"][obj]["Terms"]
+            next(
+                (
+                    item[synonym_name].update({"State": "Deleted"})
+                    for item in data
+                    if synonym_name in item
+                ),
+                None,
+            )
+
+            self.model.Cultures[culture].LinguisticMetadata.Content = json.dumps(
+                lm, indent=4
+            )
+            print(
+                f"{icons.green_dot} The '{synonym_name}' synonym was marked as status 'Deleted' for the '{object.Name}' object."
+            )
+        else:
+            print(
+                f"{icons.info} The '{synonym_name}' synonym does not exist for the '{object.Name}' object."
+            )
+
+    def _lock_linguistic_schema(self, culture: str):
+
+        c = self.model.Cultures[culture]
+        if c.LinguisticMetadata is not None:
+            lm = json.loads(c.LinguisticMetadata.Content)
+            if "DynamicImprovement" not in lm:
+                lm["DynamicImprovement"] = {}
+            lm["DynamicImprovement"]["Schema"] = None
+
+            c.LinguisticMetadata.Content = json.dumps(lm, indent=4)
+
+    def _unlock_linguistic_schema(self, culture: str):
+
+        c = self.model.Cultures[culture]
+        if c.LinguisticMetadata is not None:
+            lm = json.loads(c.LinguisticMetadata.Content)
+            if "DynamicImprovement" in lm:
+                del lm["DynamicImprovement"]["Schema"]
+
+            c.LinguisticMetadata.Content = json.dumps(lm, indent=4)
+
+    def _export_linguistic_schema(self, culture: str, file_path: str):
+
+        if not lakehouse_attached():
+            raise ValueError(
+                f"{icons.red_dot} A lakehouse must be attached to the notebook in order to export a linguistic schema."
+            )
+
+        if not any(c.Name == culture for c in self.model.Cultures):
+            raise ValueError(
+                f"{icons.red_dot} The '{culture}' culture does not exist within the semantic model."
+            )
+
+        folderPath = "/lakehouse/default/Files"
+        fileExt = ".json"
+        if not file_path.endswith(fileExt):
+            file_path = f"{file_path}{fileExt}"
+
+        for c in self.model.Cultures:
+            if c.Name == culture:
+                lm = json.loads(c.LinguisticMetadata.Content)
+                filePath = os.path.join(folderPath, file_path)
+                with open(filePath, "w") as json_file:
+                    json.dump(lm, json_file, indent=4)
+
+                print(
+                    f"{icons.green_dot} The linguistic schema for the '{culture}' culture was saved as the '{file_path}' file within the lakehouse attached to this notebook."
+                )
+
+    def _import_linguistic_schema(self, file_path: str):
+
+        if not file_path.endswith(".json"):
+            raise ValueError(f"{icons.red_dot} The 'file_path' must be a .json file.")
+
+        with open(file_path, "r") as json_file:
+            schema_file = json.load(json_file)
+
+            # Validate structure
+            required_keys = ["Version", "Language", "Entities", "Relationships"]
+            if not all(key in schema_file for key in required_keys):
+                raise ValueError(
+                    f"{icons.red_dot} The 'schema_file' is not in the proper format."
+                )
+
+            culture_name = schema_file["Language"]
+
+            # Validate culture
+            if not any(c.Name == culture_name for c in self.model.Cultures):
+                raise ValueError(
+                    f"{icons.red_dot} The culture of the schema_file is not a valid culture within the semantic model."
+                )
+
+            self.model.Cultures[culture_name].LinguisticMetadata.Content = json.dumps(
+                schema_file, indent=4
+            )
+
     def close(self):
+
+        # DAX Formatting
+        from sempy_labs._daxformatter import _format_dax
+
+        def _process_dax_objects(object_type, model_accessor=None):
+            items = self._dax_formatting.get(object_type, [])
+            if not items:
+                return False
+
+            # Extract and format expressions
+            expressions = [item["expression"] for item in items]
+            metadata = [
+                {"name": item["name"], "table": item["table"], "type": object_type}
+                for item in items
+            ]
+
+            formatted_expressions = _format_dax(expressions, metadata=metadata)
+
+            # Update the expressions in the original structure
+            for item, formatted in zip(items, formatted_expressions):
+                item["expression"] = formatted
+
+            # Apply updated expressions to the model
+            for item in items:
+                table_name = (
+                    item["table"]
+                    if object_type != "calculated_tables"
+                    else item["name"]
+                )
+                name = item["name"]
+                expression = item["expression"]
+
+                if object_type == "calculated_tables":
+                    t = self.model.Tables[table_name]
+                    p = next(p for p in t.Partitions)
+                    p.Source.Expression = expression
+                elif object_type == "rls":
+                    self.model.Roles[name].TablePermissions[
+                        table_name
+                    ].FilterExpression = expression
+                elif object_type == "calculation_items":
+                    self.model.Tables[table_name].CalculationGroup.CalculationItems[
+                        name
+                    ].Expression = expression
+                else:
+                    getattr(self.model.Tables[table_name], model_accessor)[
+                        name
+                    ].Expression = expression
+            return True
+
+        # Use the helper for each object type
+        a = _process_dax_objects("measures", "Measures")
+        b = _process_dax_objects("calculated_columns", "Columns")
+        c = _process_dax_objects("calculation_items")
+        d = _process_dax_objects("calculated_tables")
+        e = _process_dax_objects("rls")
+        if any([a, b, c, d, e]) and not self._readonly:
+            from IPython.display import display, HTML
+
+            html = """
+            <span style="font-family: Segoe UI, Arial, sans-serif; color: #cccccc;">
+                CODE BEAUTIFIED WITH
+            </span>
+            <a href="https://www.daxformatter.com" target="_blank" style="font-family: Segoe UI, Arial, sans-serif; color: #ff5a5a; font-weight: bold; text-decoration: none;">
+                DAX FORMATTER
+            </a>
+            """
+
+            display(HTML(html))
 
         if not self._readonly and self.model is not None:
 
             import Microsoft.AnalysisServices.Tabular as TOM
 
             # ChangedProperty logic (min compat level is 1567) https://learn.microsoft.com/dotnet/api/microsoft.analysisservices.tabular.changedproperty?view=analysisservices-dotnet
-            if self.model.Model.Database.CompatibilityLevel >= 1567:
+            if self.model.Database.CompatibilityLevel >= 1567:
                 for t in self.model.Tables:
                     if any(
                         p.SourceType == TOM.PartitionSourceType.Entity
                         for p in t.Partitions
                     ):
-                        if t.LineageTag in list(self._table_map.keys()):
-                            if self._table_map.get(t.LineageTag) != t.Name:
-                                self.add_changed_property(object=t, property="Name")
+                        entity_name = next(p.Source.EntityName for p in t.Partitions)
+                        if t.Name != entity_name:
+                            self.add_changed_property(object=t, property="Name")
+                        # if t.LineageTag in list(self._table_map.keys()):
+                        #    if self._table_map.get(t.LineageTag) != t.Name:
+                        #        self.add_changed_property(object=t, property="Name")
 
                 for c in self.all_columns():
+                    # if c.LineageTag in list(self._column_map.keys()):
+                    if any(
+                        p.SourceType == TOM.PartitionSourceType.Entity
+                        for p in c.Parent.Partitions
+                    ):
+                        if c.Name != c.SourceColumn:
+                            self.add_changed_property(object=c, property="Name")
+                        # c.SourceLineageTag = c.SourceColumn
+                        # if self._column_map.get(c.LineageTag)[0] != c.Name:
+                        #    self.add_changed_property(object=c, property="Name")
                     if c.LineageTag in list(self._column_map.keys()):
-                        if any(
-                            p.SourceType == TOM.PartitionSourceType.Entity
-                            for p in c.Parent.Partitions
-                        ):
-                            if self._column_map.get(c.LineageTag)[0] != c.Name:
-                                self.add_changed_property(object=c, property="Name")
                         if self._column_map.get(c.LineageTag)[1] != c.DataType:
                             self.add_changed_property(object=c, property="DataType")
 
@@ -4572,9 +5989,9 @@ class TOMWrapper:
 
             if len(self._tables_added) > 0:
                 refresh_semantic_model(
-                    dataset=self._dataset,
+                    dataset=self._dataset_id,
                     tables=self._tables_added,
-                    workspace=self._workspace,
+                    workspace=self._workspace_id,
                 )
             self.model = None
 
@@ -4584,19 +6001,24 @@ class TOMWrapper:
 @log
 @contextmanager
 def connect_semantic_model(
-    dataset: str, readonly: bool = True, workspace: Optional[str] = None
+    dataset: str | UUID,
+    readonly: bool = True,
+    workspace: Optional[str | UUID] = None,
 ) -> Iterator[TOMWrapper]:
     """
     Connects to the Tabular Object Model (TOM) within a semantic model.
 
+    Service Principal Authentication is supported (see `here <https://github.com/microsoft/semantic-link-labs/blob/main/notebooks/Service%20Principal.ipynb>`_ for examples).
+
     Parameters
     ----------
-    dataset : str
-        Name of the semantic model.
+    dataset : str | uuid.UUID
+        Name or ID of the semantic model.
     readonly: bool, default=True
         Whether the connection is read-only or read/write. Setting this to False enables read/write which saves the changes made back to the server.
-    workspace : str, default=None
-        The Fabric workspace name.
+    workspace : str | uuid.UUID, default=None
+        The Fabric workspace name or ID. Also supports Azure Analysis Services (Service Principal Authentication required).
+        If connecting to Azure Analysis Services, enter the workspace parameter in the following format: 'asazure://<region>.asazure.windows.net/<server_name>'.
         Defaults to None which resolves to the workspace of the attached lakehouse
         or if no lakehouse attached, resolves to the workspace of the notebook.
 
@@ -4609,11 +6031,11 @@ def connect_semantic_model(
     # initialize .NET to make sure System and Microsoft.AnalysisServices.Tabular is defined
     sempy.fabric._client._utils._init_analysis_services()
 
-    if workspace is None:
-        workspace_id = fabric.get_workspace_id()
-        workspace = fabric.resolve_workspace_name(workspace_id)
-
-    tw = TOMWrapper(dataset=dataset, workspace=workspace, readonly=readonly)
+    tw = TOMWrapper(
+        dataset=dataset,
+        workspace=workspace,
+        readonly=readonly,
+    )
     try:
         yield tw
     finally:

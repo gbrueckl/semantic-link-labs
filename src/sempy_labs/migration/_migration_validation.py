@@ -1,7 +1,6 @@
-import sempy.fabric as fabric
 import pandas as pd
 from typing import Optional
-from sempy_labs._list_functions import list_semantic_model_objects
+from .._list_functions import list_semantic_model_objects
 from sempy._utils._log import log
 import sempy_labs._icons as icons
 
@@ -41,10 +40,6 @@ def migration_validation(
         raise ValueError(
             f"{icons.red_dot} The 'dataset' and 'new_dataset' parameters are both set to '{dataset}'. These parameters must be set to different values."
         )
-
-    workspace = fabric.resolve_workspace_name(workspace)
-    if new_dataset_workspace is None:
-        new_dataset_workspace = workspace
 
     icons.sll_tags.append("DirectLakeMigration")
 
